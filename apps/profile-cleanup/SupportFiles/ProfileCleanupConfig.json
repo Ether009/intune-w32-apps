@@ -1,0 +1,34 @@
+﻿{
+  "Version": "1.25.8",
+  "RetentionDays": 30,
+  "LogOnly": false,
+  "ProtectedRecentUsers": 2,
+  "ExcludedSids": [],
+  "ExcludedUsernames": ["IntelTelemetryAgent", "WsiAccount"],
+  "NotificationWebhookUrl": "https://default46d9804ee6e3433ca5fe7660161442.75.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/16/workflows/a6170f01375040d7bd58fdb5dff1d576/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=jZuaenvLt0q06U-TKm2AkYR3R4jCWIm-O3qzVWmWEsk",
+  "NotifyOnlyIfActionable": false,
+  "IncludeProfileSize": true,
+  "TopFolderCount": 10,
+  "TopFolderMinMB": 0,
+  "ActivityPaths": [
+    "AppData\\Roaming\\Microsoft\\Windows\\Recent",
+    "AppData\\Local\\Microsoft\\Edge\\User Data\\Default",
+    "AppData\\Local\\Google\\Chrome\\User Data\\Default"
+  ],
+  "Dehydrate": true,
+  "ClearBrowserCaches": true,
+  "BrowserCachePaths": [
+    "AppData\\Local\\Microsoft\\Edge\\User Data\\*\\Cache",
+    "AppData\\Local\\Microsoft\\Edge\\User Data\\*\\Code Cache",
+    "AppData\\Local\\Microsoft\\Edge\\User Data\\*\\GPUCache",
+    "AppData\\Local\\Google\\Chrome\\User Data\\*\\Cache",
+    "AppData\\Local\\Google\\Chrome\\User Data\\*\\Code Cache",
+    "AppData\\Local\\Google\\Chrome\\User Data\\*\\GPUCache",
+    "AppData\\Local\\Mozilla\\Firefox\\Profiles\\*\\cache2"
+  ],
+  "RedirectFolders": [],
+  "AdditionalDehydrateFolders": [],
+  "DownloadsPurgeUsernames": ["shared-user"],
+  "DownloadsPurgeUpns": [],
+  "ScanDownloads": true
+}
