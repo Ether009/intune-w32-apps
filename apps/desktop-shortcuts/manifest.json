@@ -1,0 +1,6 @@
+{
+  "displayName": "Desktop Shortcut Deployment",
+  "intuneAppId": "5800384e-256e-4be6-82a1-cabbaf8311be",
+  "detectionRegistryPath": "HKLM:\\SOFTWARE\\LundsFontanhus\\ShortcutDeployment",
+  "detectionRegistryValueName": "Version"
+}

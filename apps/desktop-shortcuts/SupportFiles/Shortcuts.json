@@ -1,0 +1,56 @@
+[
+  {
+    "Name": "Lunds Fontänhus Hemsida",
+    "Type": "Url",
+    "Target": "https://lundsfontanhus.se",
+    "IconFile": "lundsfontan.ico"
+  },
+  {
+    "Name": "Fontanreg",
+    "Type": "Url",
+    "Target": "https://fontanreg.sverigesfontanhus.se",
+    "IconFile": "fontanreg.ico"
+  },
+  {
+    "Name": "Canva",
+    "Type": "Url",
+    "Target": "https://www.canva.com",
+    "IconFile": "canva.ico"
+  },
+  {
+    "Name": "Microsoft To-Do",
+    "Type": "Url",
+    "Target": "https://to-do.office.com",
+    "IconFile": "todo.ico"
+  },
+  {
+    "Name": "Microsoft Word Online",
+    "Type": "Url",
+    "Target": "https://word.office.com",
+    "IconFile": "word.ico"
+  },
+  {
+    "Name": "Outlook Online",
+    "Type": "Url",
+    "Target": "https://outlook.office.com",
+    "IconFile": "outlook.ico"
+  },
+  {
+    "Name": "Loomly",
+    "Type": "Url",
+    "Target": "https://app.loomly.com",
+    "IconFile": "loomly.ico"
+  },
+  {
+    "Name": "ChatGPT",
+    "Type": "Url",
+    "Target": "https://chatgpt.com",
+    "IconFile": "chatgpt.ico"
+  },
+  {
+    "Name": "Claude",
+    "Type": "Url",
+    "Target": "https://claude.ai",
+    "IconFile": "claude.ico"
+  }
+]
