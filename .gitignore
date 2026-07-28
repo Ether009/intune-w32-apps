@@ -1,0 +1,14 @@
+# Official PSADT template payload - the CI pipeline downloads the pinned release
+# and verifies its hash; a local working copy may have these extracted in place
+# under each app folder for local testing.
+apps/*/Assets/
+apps/*/Config/
+apps/*/Files/
+apps/*/Strings/
+apps/*/PSAppDeployToolkit/
+apps/*/PSAppDeployToolkit.Extensions/
+apps/*/Invoke-AppDeployToolkit.exe
+
+# Build output
+*.intunewin
+*.orig

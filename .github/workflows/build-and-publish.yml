@@ -1,0 +1,195 @@
+name: Build and publish to Intune
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - '.github/workflows/build-and-publish.yml'
+  workflow_dispatch:
+
+env:
+  PSADT_TEMPLATE_URL: 'https://github.com/PSAppDeployToolkit/PSAppDeployToolkit/releases/download/4.1.8/PSAppDeployToolkit_Template_v4.zip'
+  PSADT_TEMPLATE_SHA256: '50CB8D32973FC7648060A48CAD63912ECB5CACA5A70754F37E83AA06BD380283'
+  PREP_TOOL_URL: 'https://github.com/microsoft/Microsoft-Win32-Content-Prep-Tool/raw/master/IntuneWinAppUtil.exe'
+  PREP_TOOL_SHA256: 'C1BA45B5CB939E84AF064BB7FF4B38FB3DFE33C8DC1078FD9B157672EAE671F6'
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.list.outputs.apps }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find apps with a manifest
+        id: list
+        run: |
+          apps=$(for d in apps/*/; do
+            name=$(basename "$d")
+            if [ -f "apps/$name/manifest.json" ]; then
+              echo "$name"
+            fi
+          done | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "apps=$apps" >> "$GITHUB_OUTPUT"
+          echo "Discovered apps: $apps"
+
+  build-and-publish:
+    needs: discover
+    if: needs.discover.outputs.apps != '[]'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJson(needs.discover.outputs.apps) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read app manifest and version
+        id: meta
+        shell: powershell
+        env:
+          APP_DIR: ${{ matrix.app }}
+        run: |
+          $appPath = Join-Path $env:GITHUB_WORKSPACE "apps\$env:APP_DIR"
+          $manifest = Get-Content -LiteralPath (Join-Path $appPath 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+
+          $deployScript = Join-Path $appPath 'Invoke-AppDeployToolkit.ps1'
+          $content = Get-Content -LiteralPath $deployScript -Raw -Encoding UTF8
+          if ($content -notmatch "AppVersion\s*=\s*'([^']+)'") { throw "Could not parse AppVersion from $deployScript" }
+          $version = $Matches[1]
+
+          "App: $env:APP_DIR | Version: $version | Intune app: $($manifest.intuneAppId)"
+          "version=$version"                                       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+          "intuneAppId=$($manifest.intuneAppId)"                    | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+          "detectionRegistryPath=$($manifest.detectionRegistryPath)"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+          "detectionRegistryValueName=$($manifest.detectionRegistryValueName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+
+      - name: Assemble package source (pinned PSADT template + app files)
+        shell: powershell
+        env:
+          APP_DIR: ${{ matrix.app }}
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $zip = Join-Path $env:RUNNER_TEMP 'psadt-template.zip'
+          Invoke-WebRequest -Uri $env:PSADT_TEMPLATE_URL -OutFile $zip -UseBasicParsing
+          $hash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash
+          if ($hash -ne $env:PSADT_TEMPLATE_SHA256) { throw "PSADT template hash mismatch: got $hash" }
+
+          $staging = Join-Path $env:RUNNER_TEMP "staging-$env:APP_DIR"
+          Expand-Archive -Path $zip -DestinationPath $staging -Force
+
+          $appPath = Join-Path $env:GITHUB_WORKSPACE "apps\$env:APP_DIR"
+          Copy-Item (Join-Path $appPath 'Invoke-AppDeployToolkit.ps1') -Destination $staging -Force
+          Copy-Item (Join-Path $appPath 'SupportFiles\*') -Destination (Join-Path $staging 'SupportFiles') -Recurse -Force
+          Remove-Item (Join-Path $staging 'SupportFiles\Add Supporting Files Here.txt') -Force -ErrorAction SilentlyContinue
+
+          "Staging assembled for $env:APP_DIR:"
+          Get-ChildItem $staging | Select-Object -ExpandProperty Name
+
+      - name: Build .intunewin
+        shell: powershell
+        env:
+          APP_DIR: ${{ matrix.app }}
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $tool = Join-Path $env:RUNNER_TEMP 'IntuneWinAppUtil.exe'
+          if (-not (Test-Path $tool)) {
+            Invoke-WebRequest -Uri $env:PREP_TOOL_URL -OutFile $tool -UseBasicParsing
+            $hash = (Get-FileHash -Path $tool -Algorithm SHA256).Hash
+            if ($hash -ne $env:PREP_TOOL_SHA256) { throw "Content prep tool hash mismatch: got $hash (tool may have been updated upstream; verify and re-pin)" }
+          }
+
+          $staging = Join-Path $env:RUNNER_TEMP "staging-$env:APP_DIR"
+          $out = Join-Path $env:RUNNER_TEMP "out-$env:APP_DIR"
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          & $tool -c $staging -s (Join-Path $staging 'Invoke-AppDeployToolkit.exe') -o $out -q
+          if ($LASTEXITCODE -ne 0) { throw "IntuneWinAppUtil failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path "$out\Invoke-AppDeployToolkit.intunewin")) { throw "Expected .intunewin not produced" }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.app }}-${{ steps.meta.outputs.version }}
+          path: ${{ runner.temp }}\out-${{ matrix.app }}\Invoke-AppDeployToolkit.intunewin
+          if-no-files-found: error
+
+      - name: Publish to Intune
+        shell: powershell
+        env:
+          TENANT_ID: ${{ secrets.INTUNE_TENANT_ID }}
+          CLIENT_ID: ${{ secrets.INTUNE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.INTUNE_CLIENT_SECRET }}
+          APP_VERSION: ${{ steps.meta.outputs.version }}
+          INTUNE_APP_ID: ${{ steps.meta.outputs.intuneAppId }}
+          DETECTION_REG_PATH: ${{ steps.meta.outputs.detectionRegistryPath }}
+          DETECTION_REG_VALUE: ${{ steps.meta.outputs.detectionRegistryValueName }}
+          APP_DIR: ${{ matrix.app }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TENANT_ID) -or [string]::IsNullOrWhiteSpace($env:CLIENT_ID) -or [string]::IsNullOrWhiteSpace($env:CLIENT_SECRET)) {
+            Write-Warning "[$env:APP_DIR] Intune credentials are not configured (INTUNE_TENANT_ID / INTUNE_CLIENT_ID / INTUNE_CLIENT_SECRET). Skipping publish."
+            exit 0
+          }
+          if ([string]::IsNullOrWhiteSpace($env:INTUNE_APP_ID)) {
+            throw "[$env:APP_DIR] manifest.json is missing intuneAppId."
+          }
+
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          $tokenResponse = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$env:TENANT_ID/oauth2/v2.0/token" -Body @{
+            grant_type    = 'client_credentials'
+            client_id     = $env:CLIENT_ID
+            client_secret = $env:CLIENT_SECRET
+            scope         = 'https://graph.microsoft.com/.default'
+          }
+          $headers = @{ Authorization = "Bearer $($tokenResponse.access_token)" }
+
+          $app = Invoke-RestMethod -Method Get -Uri "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$env:INTUNE_APP_ID" -Headers $headers
+          "[$env:APP_DIR] Intune app version: $($app.displayVersion) | repo version: $env:APP_VERSION"
+          if ($app.displayVersion -eq $env:APP_VERSION) {
+            Write-Output "[$env:APP_DIR] Version unchanged - skipping publish."
+            exit 0
+          }
+
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+          Install-Module -Name IntuneWin32App -RequiredVersion 1.4.4 -Force -Scope CurrentUser -AllowClobber
+          Import-Module IntuneWin32App
+          Connect-MSIntuneGraph -TenantID $env:TENANT_ID -ClientID $env:CLIENT_ID -ClientSecret $env:CLIENT_SECRET | Out-Null
+          $package = Join-Path $env:RUNNER_TEMP "out-$env:APP_DIR\Invoke-AppDeployToolkit.intunewin"
+          Update-IntuneWin32AppPackageFile -ID $env:INTUNE_APP_ID -FilePath $package -Verbose
+
+          # Regenerated from this app's manifest.json + AppVersion on every publish, so
+          # the install and its detection rule can never drift apart.
+          $detection = @(
+            "# Version-specific by design: a device on an older version must report",
+            "# not-installed so that Intune deploys the update.",
+            "`$regPath = '$env:DETECTION_REG_PATH'",
+            "`$expectedVersion = '$env:APP_VERSION'",
+            "",
+            "if (Test-Path -LiteralPath `$regPath) {",
+            "    `$installedVersion = (Get-ItemProperty -LiteralPath `$regPath -Name '$env:DETECTION_REG_VALUE' -ErrorAction SilentlyContinue).'$env:DETECTION_REG_VALUE'",
+            "    if (`$installedVersion -eq `$expectedVersion) {",
+            "        Write-Output 'Detected'",
+            "        exit 0",
+            "    }",
+            "}",
+            "",
+            "exit 1"
+          ) -join "`r`n"
+
+          $patchBody = @{
+            '@odata.type'  = '#microsoft.graph.win32LobApp'
+            displayVersion = $env:APP_VERSION
+            detectionRules = @(
+              @{
+                '@odata.type'         = '#microsoft.graph.win32LobAppPowerShellScriptDetection'
+                scriptContent         = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($detection))
+                enforceSignatureCheck = $false
+                runAs32Bit            = $false
+              }
+            )
+          } | ConvertTo-Json -Depth 5
+
+          Invoke-RestMethod -Method Patch -Uri "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$env:INTUNE_APP_ID" -Headers $headers -Body $patchBody -ContentType 'application/json'
+          Write-Output "[$env:APP_DIR] Published version $env:APP_VERSION to Intune."
