@@ -1,6 +1,0 @@
-{
-  "displayName": "User Profile Cleanup",
-  "intuneAppId": "983ae613-10b3-4124-9c91-0549436ffbc9",
-  "detectionRegistryPath": "HKLM:\\SOFTWARE\\Organization\\ProfileCleanup",
-  "detectionRegistryValueName": "Version"
-}
