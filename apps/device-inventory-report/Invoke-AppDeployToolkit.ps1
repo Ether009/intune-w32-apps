@@ -98,14 +98,14 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Organization'
     AppName = 'Device Inventory Report'
-    AppVersion = '1.0.0'
+    AppVersion = '1.0.1'
     AppArch = ''
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.0.0'
+    AppScriptVersion = '1.0.1'
     AppScriptDate = '2026-07-31'
     AppScriptAuthor = ''
     RequireAdmin = $true
