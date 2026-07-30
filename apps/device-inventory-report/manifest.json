@@ -1,0 +1,6 @@
+{
+  "displayName": "Device Inventory Report",
+  "intuneAppId": "fb42f268-29c8-4520-a3e4-227120fde04f",
+  "detectionRegistryPath": "HKLM:\\SOFTWARE\\Organization\\DeviceInventory",
+  "detectionRegistryValueName": "Version"
+}
