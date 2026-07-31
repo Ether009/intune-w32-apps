@@ -156,46 +156,61 @@ Autopilot even though they happily report TPM 2.0/enabled/activated/owned.
 
 **This repo is public.** Nothing that authenticates a device to the ingest endpoint
 can live in this app's package or anywhere in this repo - a static secret was tried
-first and had to be rotated after it was briefly committed here. Rather than finding
-a cleverer place to hide a shared secret, the design changed: devices authenticate
-with a **client certificate (mutual TLS)** instead. A certificate can't leak by being
-committed to source control, because it's never generated or stored there in the
-first place - it only ever exists in the Windows certificate store (delivered by
-Intune) and on the server.
+first and had to be rotated after it was briefly committed here. The fix: devices
+authenticate with a **client certificate (mutual TLS)**, and that certificate is
+**injected into the package at CI build time** from GitHub repo secrets - the exact
+same pattern this workflow already uses for `INTUNE_CLIENT_SECRET` - rather than
+being delivered by any separate mechanism.
 
-The certificate is a single shared cert across the whole fleet (not a unique
-per-device certificate - that would need standing up real PKI infrastructure, an
-on-prem/VM Certificate Authority plus Intune's Certificate Connector, disproportionate
-to what this actually needs), delivered via Intune's **Certificate profiles** - a
-native MDM feature, not a script, so it isn't subject to the reliability problems
-Platform scripts/Proactive Remediations can have.
+Two things were considered and ruled out first, worth knowing so nobody re-discovers
+the same dead ends:
+- **An Intune Certificate profile** (PKCS certificate / PKCS imported certificate)
+  sounds like the obvious native fit, but *both* variants require the **Certificate
+  Connector for Microsoft Intune**, which only installs on Windows Server - this
+  stack is Ubuntu-only, so that's real infrastructure this org doesn't have and
+  would have to stand up just for this.
+- **A "Trusted certificate" profile** doesn't help either - it only delivers a
+  *public* certificate into the trust store (for a device to trust a CA), never a
+  private key. mTLS needs the device to hold a private key to prove its own
+  identity, which that profile type structurally cannot deliver.
 
-**One-time setup:**
+**How it actually works:**
 
-1. A CA and client certificate were generated once (`openssl`, 5-year validity) and
-   bundled into a password-protected `client.pfx`. The server already trusts this CA
-   (`/opt/dashhouse-api/certs/ca.crt` on the VM, referenced by
+1. A CA and client certificate were generated once (`openssl`, 5-year validity). The
+   server trusts this CA (`/opt/dashhouse-api/certs/ca.crt` on the VM, referenced by
    `DEVICE_INGEST_CA_PATH` / `DEVICE_INGEST_CLIENT_CN` in the Admin UI's `.env`).
-2. **Intune admin center > Devices > Configuration > Create > New policy > Windows 10
-   and later > Templates > Certificates > PKCS import.**
-3. Upload `client.pfx`, provide its password (kept only outside git, not in this
-   repo), leave the exportable/store location per your organization's normal cert
-   policy.
-4. **Assignment:** the same device group as this app.
-5. Devices pick up the certificate on their normal Intune sync into
-   `Cert:\LocalMachine\My`, keyed by subject `CN=dashhouse-device-ingest-client` -
-   matching `IngestClientCertSubjectCn` in `DeviceInventoryConfig.json`. As long as
-   both the app and the certificate profile are assigned together, the certificate
-   exists well before the weekly collection task first needs it.
+2. The client cert+key (as a password-protected PFX) live **only** as two GitHub
+   repo secrets: `DEVICE_INGEST_CLIENT_PFX_BASE64` and
+   `DEVICE_INGEST_CLIENT_PFX_PASSWORD` (Settings > Secrets and variables > Actions).
+   Never in a file in this repo.
+3. `build-and-publish.yml`'s "Inject device-inventory-report ingest client
+   certificate" step (app-specific, guarded by `if: matrix.app ==
+   'device-inventory-report'`) decodes those secrets straight into the **staged**
+   package - not the repo checkout - as `SupportFiles/client-cert.pfx` /
+   `client-cert.pfx.pw`, right before the `.intunewin` is built. They exist only for
+   that CI run and inside the resulting `.intunewin`, which lives in Intune's app
+   content storage, not source control.
+4. `Invoke-AppDeployToolkit.ps1`'s `Install-IngestClientCertificate` imports the PFX
+   into `Cert:\LocalMachine\My` during install, then deletes both files from disk -
+   nothing lingers once the private key is in the certificate store. Keyed by
+   subject `CN=dashhouse-device-ingest-client`, matching
+   `IngestClientCertSubjectCn` in `DeviceInventoryConfig.json`.
+5. A **local, hand-assembled test build** (extracting the PSADT template yourself
+   rather than letting CI do it) simply won't have these two files - that's expected,
+   not a bug. `Install-IngestClientCertificate` logs a warning and continues rather
+   than failing the rest of the install, so everything else is still testable
+   locally. Only a real CI-built package can actually authenticate to the ingest
+   endpoint.
 
-Without the certificate present, `Get-IngestClientCertificate` logs a clear error and
-the script exits - worker-script failure, not a crash, so Intune sees a clean
-non-zero exit rather than a hang.
+Without the certificate present at runtime, `Get-IngestClientCertificate` in the
+collection script logs a clear error and exits - worker-script failure, not a crash,
+so Intune sees a clean non-zero exit rather than a hang.
 
 **To rotate:** generate a new CA/cert, update `ca.crt` and the `.env` values on the
-VM, restart `dashhouse-admin`, then upload a new PFX via a new/edited Certificate
-profile. No `AppVersion` bump needed for a rotation alone, since this app's own
-package never contains anything secret to begin with.
+VM, restart `dashhouse-admin`, then update the two `DEVICE_INGEST_CLIENT_PFX_*` repo
+secrets and bump `AppVersion` to force a republish (this time a version bump *is*
+needed, since the new cert has to actually get built into a new package and pushed
+to devices).
 
 ---
 

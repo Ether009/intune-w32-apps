@@ -88,6 +88,35 @@ jobs:
           "Staging assembled for $env:APP_DIR:"
           Get-ChildItem $staging | Select-Object -ExpandProperty Name
 
+      # device-inventory-report authenticates to its ingest endpoint with a client
+      # certificate (mutual TLS) instead of a shared secret, after an earlier shared
+      # secret was briefly committed to this (public) repo and had to be rotated. The
+      # certificate is injected here, at build time, from repo secrets - the same
+      # pattern already used below for INTUNE_CLIENT_SECRET - so it never exists in
+      # git history, only transiently in this runner and in the built .intunewin
+      # (which lives in Intune's app content storage, not source control). The
+      # installer (Invoke-AppDeployToolkit.ps1) imports it into the certificate store
+      # during install and deletes both files from disk afterward.
+      - name: Inject device-inventory-report ingest client certificate
+        if: matrix.app == 'device-inventory-report'
+        shell: powershell
+        env:
+          APP_DIR: ${{ matrix.app }}
+          CLIENT_PFX_BASE64: ${{ secrets.DEVICE_INGEST_CLIENT_PFX_BASE64 }}
+          CLIENT_PFX_PASSWORD: ${{ secrets.DEVICE_INGEST_CLIENT_PFX_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CLIENT_PFX_BASE64) -or [string]::IsNullOrWhiteSpace($env:CLIENT_PFX_PASSWORD)) {
+            throw "[$env:APP_DIR] DEVICE_INGEST_CLIENT_PFX_BASE64 / DEVICE_INGEST_CLIENT_PFX_PASSWORD repo secrets are not configured - this app cannot authenticate to its ingest endpoint without them."
+          }
+          $staging = Join-Path $env:RUNNER_TEMP "staging-$env:APP_DIR"
+          $supportFiles = Join-Path $staging 'SupportFiles'
+          # [System.IO.File]::WriteAllBytes/AllText rather than Set-Content -AsByteStream:
+          # that parameter is PowerShell 6+/Core only and this step runs under Windows
+          # PowerShell 5.1 (shell: powershell), where it doesn't exist.
+          [System.IO.File]::WriteAllBytes((Join-Path $supportFiles 'client-cert.pfx'), [Convert]::FromBase64String($env:CLIENT_PFX_BASE64))
+          [System.IO.File]::WriteAllText((Join-Path $supportFiles 'client-cert.pfx.pw'), $env:CLIENT_PFX_PASSWORD, [Text.Encoding]::UTF8)
+          "[$env:APP_DIR] Ingest client certificate injected into staged package."
+
       - name: Build .intunewin
         shell: powershell
         env:

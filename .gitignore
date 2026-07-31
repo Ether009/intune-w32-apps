@@ -12,3 +12,9 @@ apps/*/Invoke-AppDeployToolkit.exe
 # Build output
 *.intunewin
 *.orig
+
+# device-inventory-report: CI injects the ingest mutual-TLS client cert into
+# SupportFiles at build time from repo secrets - it must never be committed. This
+# guards against it ever landing here from local testing.
+apps/device-inventory-report/SupportFiles/client-cert.pfx
+apps/device-inventory-report/SupportFiles/client-cert.pfx.pw
