@@ -1,5 +1,5 @@
 {
-  "Version": "1.0.0",
+  "Version": "3.0.0",
   "IngestUrl": "https://admin.dashhouse.kaijunet.se:8443/api/inventory",
-  "IngestKey": "Lri4o3LR2ngQVhUQMfXFnEImgrU3RgQ4lU4sFSlN"
+  "IngestClientCertSubjectCn": "dashhouse-device-ingest-client"
 }

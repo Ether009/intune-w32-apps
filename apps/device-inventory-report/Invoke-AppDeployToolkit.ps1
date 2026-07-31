@@ -98,14 +98,14 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Organization'
     AppName = 'Device Inventory Report'
-    AppVersion = '1.0.1'
+    AppVersion = '3.0.0'
     AppArch = ''
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.0.1'
+    AppScriptVersion = '3.0.0'
     AppScriptDate = '2026-07-31'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -179,6 +179,50 @@ function Register-DeviceInventoryScheduledTask
     Write-ADTLogEntry -Message "Scheduled task '$DeviceInventoryTaskName' registered and verified (runs as SYSTEM, weekly Monday 04:30 + up to 1h random delay)."
 }
 
+function Install-IngestClientCertificate
+{
+    <#
+        Imports the ingest mutual-TLS client certificate into the local machine
+        certificate store. The .pfx/.pfx.pw files only exist in SupportFiles when
+        this package was built by CI (injected from repo secrets at build time - see
+        build-and-publish.yml and this app's README's "Ingest authentication"
+        section). They are deliberately absent from the source repo itself, so a
+        local test build assembled by hand (rather than by CI) will not have them -
+        that's expected, not an error; this function logs and returns rather than
+        throwing, so a local install/uninstall test of everything else still works.
+
+        Both files are deleted after import regardless of outcome, since there's no
+        reason for the plaintext password file to persist on disk once the private
+        key has been imported into the certificate store.
+    #>
+    $pfxPath = Join-Path $adtSession.DirSupportFiles 'client-cert.pfx'
+    $pwPath = Join-Path $adtSession.DirSupportFiles 'client-cert.pfx.pw'
+
+    if (-not (Test-Path -LiteralPath $pfxPath) -or -not (Test-Path -LiteralPath $pwPath))
+    {
+        Write-ADTLogEntry -Message 'Ingest client certificate not present in this package (expected for a locally-assembled test build - CI injects it from repo secrets). Skipping certificate import.' -Severity 2
+        return
+    }
+
+    try
+    {
+        $password = (Get-Content -LiteralPath $pwPath -Raw -Encoding UTF8).Trim()
+        $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
+        Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation 'Cert:\LocalMachine\My' -Password $securePassword -Exportable:$false | Out-Null
+        Write-ADTLogEntry -Message 'Ingest client certificate imported into Cert:\LocalMachine\My.'
+    }
+    catch
+    {
+        Write-ADTLogEntry -Message "Failed to import ingest client certificate: $_" -Severity 3
+        throw
+    }
+    finally
+    {
+        Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $pwPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-ADTDeployment
 {
     [CmdletBinding()]
@@ -215,6 +259,7 @@ function Install-ADTDeployment
     ##================================================
     $adtSession.InstallPhase = "Post-$($adtSession.DeploymentType)"
 
+    Install-IngestClientCertificate
     Register-DeviceInventoryScheduledTask
     Set-ADTRegistryKey -Key $DeviceInventoryRegKey -Name 'Version' -Value $adtSession.AppVersion -Type String
 
@@ -246,6 +291,13 @@ function Uninstall-ADTDeployment
         Write-ADTLogEntry -Message "Removing scheduled task '$DeviceInventoryTaskName'."
         Unregister-ScheduledTask -TaskName $DeviceInventoryTaskName -Confirm:$false
     }
+
+    Get-ChildItem -Path 'Cert:\LocalMachine\My' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Subject -eq 'CN=dashhouse-device-ingest-client' } |
+        ForEach-Object {
+            Write-ADTLogEntry -Message "Removing ingest client certificate (thumbprint $($_.Thumbprint))."
+            Remove-Item -LiteralPath $_.PSPath -Force -ErrorAction SilentlyContinue
+        }
 
 
     ##================================================
