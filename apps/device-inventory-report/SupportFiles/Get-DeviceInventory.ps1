@@ -744,7 +744,8 @@ function Get-GeoLocation {
 function Read-InventoryConfigFile {
     <#
     .SYNOPSIS
-        Reads and parses the JSON config file (ingest URL + shared secret).
+        Reads and parses the JSON config file (ingest URL + non-secret settings).
+        Deliberately holds no secret - see Get-IngestClientCertificate for why.
     .PARAMETER Path
         Full path to the JSON config file.
     .OUTPUTS
@@ -763,12 +764,57 @@ function Read-InventoryConfigFile {
     }
 }
 
+function Get-IngestClientCertificate {
+    <#
+    .SYNOPSIS
+        Finds the client certificate used to authenticate to the ingest endpoint
+        (mutual TLS), by subject CN, in the local machine certificate store.
+        Deliberately NOT a secret shipped inside this Win32 app's package or read
+        from a plaintext file - this app's source (including its packaged content)
+        lives in a PUBLIC GitHub repo, and a static shared-secret approach was tried
+        first and had to be abandoned after it leaked that way.
+
+        The certificate is expected to be delivered separately, by an Intune
+        Certificate profile (PKCS-imported, a shared cert across the fleet) assigned
+        to the same device group as this app - see this app's README for the exact
+        setup. Intune's certificate delivery is a native MDM feature, not a script,
+        so it isn't subject to the reliability problems ordinary PowerShell-based
+        delivery (Platform scripts / Proactive Remediations) can have.
+    .PARAMETER SubjectCn
+        The certificate's expected Subject Common Name.
+    .OUTPUTS
+        [System.Security.Cryptography.X509Certificates.X509Certificate2] the
+        certificate, or $null if no match was found in the local machine store.
+    #>
+    param([Parameter(Mandatory)][String]$SubjectCn)
+    try {
+        $cert = Get-ChildItem -Path 'Cert:\LocalMachine\My' -ErrorAction Stop |
+            Where-Object { $_.Subject -eq "CN=$SubjectCn" -and $_.HasPrivateKey } |
+            Sort-Object NotAfter -Descending | Select-Object -First 1
+        if (-not $cert) {
+            Write-InventoryLog -Severity Error -Message "No certificate with subject 'CN=$SubjectCn' and a private key found in Cert:\LocalMachine\My - has the Intune Certificate profile that delivers it been assigned to this device yet? See README."
+            return $null
+        }
+        return $cert
+    } catch {
+        Write-InventoryLog -Severity Error -Message "Certificate store lookup failed: $_"
+        return $null
+    }
+}
+
 #region Main
 Write-InventoryLog -Message 'Starting device inventory collection.'
 
 $config = Read-InventoryConfigFile -Path $ConfigPath
-if (-not $config -or -not $config.IngestUrl -or -not $config.IngestKey) {
-    Write-InventoryLog -Severity Error -Message 'Missing IngestUrl/IngestKey in config - aborting.'
+if (-not $config -or -not $config.IngestUrl) {
+    Write-InventoryLog -Severity Error -Message 'Missing IngestUrl in config - aborting.'
+    exit 1
+}
+
+$ingestClientCn = if ($config.IngestClientCertSubjectCn) { $config.IngestClientCertSubjectCn } else { 'dashhouse-device-ingest-client' }
+$ingestCert = Get-IngestClientCertificate -SubjectCn $ingestClientCn
+if (-not $ingestCert) {
+    Write-InventoryLog -Severity Error -Message 'Could not obtain ingest client certificate - aborting.'
     exit 1
 }
 
@@ -891,7 +937,7 @@ try {
     # Encoding the body to UTF-8 bytes explicitly avoids that.
     $payloadBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
     $response = Invoke-RestMethod -Method Post -Uri $config.IngestUrl -Body $payloadBytes -ContentType 'application/json; charset=utf-8' `
-        -Headers @{ 'X-Ingest-Key' = $config.IngestKey } -TimeoutSec 30
+        -Certificate $ingestCert -TimeoutSec 30
     Write-InventoryLog -Message "Report sent successfully for device ID '$azureAdDeviceId'. Response: $($response | ConvertTo-Json -Compress)"
 } catch {
     Write-InventoryLog -Severity Error -Message "Failed to send report: $_"

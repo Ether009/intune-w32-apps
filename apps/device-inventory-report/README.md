@@ -101,10 +101,11 @@ patches requiring a reboot).
 
 ## Where the data goes
 
-`POST https://admin.dashhouse.kaijunet.se:8443/api/inventory`, authenticated via an
-`X-Ingest-Key` header (secret stored in the Admin UI's `.env` as `DEVICE_INGEST_KEY`)
-rather than the Entra ID SSO session auth the rest of the Admin UI uses - this is
-machine-to-machine.
+`POST https://admin.dashhouse.kaijunet.se:8443/api/inventory`, authenticated via
+**mutual TLS** (a shared client certificate) rather than the Entra ID SSO session
+auth the rest of the Admin UI uses - this is machine-to-machine. **No secret is ever
+part of this app's package or this repo** - see *Ingest authentication* below for why
+and how devices actually get the certificate.
 
 - **`device_extra_inventory`** - one row per device (upserted by `azure_ad_device_id`),
   holding everything that isn't inherently a list: serials, TPM/firmware/BitLocker
@@ -151,6 +152,53 @@ Autopilot even though they happily report TPM 2.0/enabled/activated/owned.
 
 ---
 
+## Ingest authentication (required one-time setup)
+
+**This repo is public.** Nothing that authenticates a device to the ingest endpoint
+can live in this app's package or anywhere in this repo - a static secret was tried
+first and had to be rotated after it was briefly committed here. Rather than finding
+a cleverer place to hide a shared secret, the design changed: devices authenticate
+with a **client certificate (mutual TLS)** instead. A certificate can't leak by being
+committed to source control, because it's never generated or stored there in the
+first place - it only ever exists in the Windows certificate store (delivered by
+Intune) and on the server.
+
+The certificate is a single shared cert across the whole fleet (not a unique
+per-device certificate - that would need standing up real PKI infrastructure, an
+on-prem/VM Certificate Authority plus Intune's Certificate Connector, disproportionate
+to what this actually needs), delivered via Intune's **Certificate profiles** - a
+native MDM feature, not a script, so it isn't subject to the reliability problems
+Platform scripts/Proactive Remediations can have.
+
+**One-time setup:**
+
+1. A CA and client certificate were generated once (`openssl`, 5-year validity) and
+   bundled into a password-protected `client.pfx`. The server already trusts this CA
+   (`/opt/dashhouse-api/certs/ca.crt` on the VM, referenced by
+   `DEVICE_INGEST_CA_PATH` / `DEVICE_INGEST_CLIENT_CN` in the Admin UI's `.env`).
+2. **Intune admin center > Devices > Configuration > Create > New policy > Windows 10
+   and later > Templates > Certificates > PKCS import.**
+3. Upload `client.pfx`, provide its password (kept only outside git, not in this
+   repo), leave the exportable/store location per your organization's normal cert
+   policy.
+4. **Assignment:** the same device group as this app.
+5. Devices pick up the certificate on their normal Intune sync into
+   `Cert:\LocalMachine\My`, keyed by subject `CN=dashhouse-device-ingest-client` -
+   matching `IngestClientCertSubjectCn` in `DeviceInventoryConfig.json`. As long as
+   both the app and the certificate profile are assigned together, the certificate
+   exists well before the weekly collection task first needs it.
+
+Without the certificate present, `Get-IngestClientCertificate` logs a clear error and
+the script exits - worker-script failure, not a crash, so Intune sees a clean
+non-zero exit rather than a hang.
+
+**To rotate:** generate a new CA/cert, update `ca.crt` and the `.env` values on the
+VM, restart `dashhouse-admin`, then upload a new PFX via a new/edited Certificate
+profile. No `AppVersion` bump needed for a rotation alone, since this app's own
+package never contains anything secret to begin with.
+
+---
+
 ## Settings
 
 Edit **`SupportFiles/DeviceInventoryConfig.json`**. No PowerShell changes needed.
@@ -158,7 +206,7 @@ Edit **`SupportFiles/DeviceInventoryConfig.json`**. No PowerShell changes needed
 | Setting | What it does |
 |---|---|
 | `IngestUrl` | The Admin UI's ingest endpoint. |
-| `IngestKey` | Shared secret sent as `X-Ingest-Key`. Must match `DEVICE_INGEST_KEY` in the Admin UI's `.env` on the VM - if you rotate one, rotate the other and bump `AppVersion` to republish. |
+| `IngestClientCertSubjectCn` | The Subject CN of the client certificate to use for mutual TLS (see *Ingest authentication* above) - identifies which certificate to use, not a secret itself. |
 
 ### Rolling out a change
 
