@@ -10,7 +10,7 @@
     monitors.
 
 .DESCRIPTION
-    Runs as NT AUTHORITY\SYSTEM from a scheduled task on a weekly trigger. Everything
+    Runs as NT AUTHORITY\SYSTEM from a scheduled task on a daily trigger. Everything
     Microsoft Graph *can* expose about a device (RAM, disk capacity, TPM version,
     BitLocker status, signed-in users, ...) is already pulled centrally by Dashhouse's
     own Intune sync job - this script exists only for what that job structurally
