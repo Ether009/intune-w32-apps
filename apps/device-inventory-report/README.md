@@ -12,8 +12,8 @@ Deployed to Intune as a Win32 app built with PSAppDeployToolkit v4.1.8.
 
 ## What it does on each device
 
-Once a week, **Monday at 04:30** (plus up to an hour of random delay so a whole fleet
-doesn't hit the ingest endpoint at once), a background task runs as SYSTEM and:
+Every day at **04:30** local time (plus up to an hour of random delay so a whole
+fleet doesn't hit the ingest endpoint at once), a background task runs as SYSTEM and:
 
 1. Reads the device's Entra ID (Azure AD) device GUID from `dsregcmd /status` - the
    same identifier Dashhouse's Intune sync already stores as `azure_ad_device_id`, so
@@ -21,12 +21,20 @@ doesn't hit the ingest endpoint at once), a background task runs as SYSTEM and:
    mapping step.
 2. Collects everything below.
 3. Posts the result as JSON to the Dashhouse Admin UI's ingest endpoint, authenticated
-   with a shared secret header. The endpoint upserts by device ID - no history is
-   kept for most fields, since most of this doesn't need one; child lists (network
-   adapters, local admins, monitors) are fully replaced each run rather than diffed.
+   via mutual TLS (see *Ingest authentication* below). The endpoint upserts by device
+   ID - no history is kept for most fields, since most of this doesn't need one;
+   child lists (network adapters, local admins, monitors) are fully replaced each run
+   rather than diffed.
 
 The install also runs the task once immediately, so a newly enrolled or newly updated
-device reports in right away rather than waiting up to a week.
+device reports in right away rather than waiting for the next scheduled run.
+
+**Why daily, not weekly:** most hardware identity fields (CPU/GPU/disk model) barely
+change day to day, but this app also collects things that can - location, which
+network the device is attached to, TPM/BitLocker/Defender state, local admin
+membership. That data is exactly what matters most *after* a device goes missing. A
+weekly cadence means up to six days of blind spot between a device's last known-good
+report and it going dark; daily bounds that to under a day.
 
 ### What's collected
 
@@ -288,7 +296,7 @@ testing.
 ```
 Invoke-AppDeployToolkit.ps1        the installer (registers the scheduled task)
 SupportFiles/
-  Get-DeviceInventory.ps1           what runs each week
+  Get-DeviceInventory.ps1           what runs each day
   DeviceInventoryConfig.json         the settings you'll actually edit
 manifest.json                      which Intune app this publishes to
 ```

@@ -11,7 +11,7 @@ PSAppDeployToolkit - This script performs the installation or uninstallation of 
 The script imports the PSAppDeployToolkit module which contains the logic and functions required to install or uninstall an application.
 
 This deployment is a background reporting framework rather than a traditional
-application install: it deploys a worker script and a weekly scheduled task that
+application install: it deploys a worker script and a daily scheduled task that
 collects hardware details Microsoft Graph does not expose for Intune-managed Windows
 devices (CPU model, GPU, primary disk model/type) and reports them to the Dashhouse
 Admin UI. See SupportFiles\Get-DeviceInventory.ps1 and README.md for the framework's
@@ -98,14 +98,14 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Organization'
     AppName = 'Device Inventory Report'
-    AppVersion = '3.0.0'
+    AppVersion = '3.1.0'
     AppArch = ''
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '3.0.0'
+    AppScriptVersion = '3.1.0'
     AppScriptDate = '2026-07-31'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -134,11 +134,15 @@ $DeviceInventoryRegKey = 'HKLM:\SOFTWARE\Organization\DeviceInventory'
 function Register-DeviceInventoryScheduledTask
 {
     <#
-        Weekly (Monday, 04:30 local time, up to 1h random delay so a whole fleet
-        doesn't hit the ingest endpoint at once). Hardware identity (CPU/GPU/disk
-        model) changes rarely, so a daily cadence like the sync/profile-cleanup jobs
-        would be wasted work - weekly is enough to catch hardware swaps and pick up
-        newly enrolled devices promptly via the run-once-on-install below.
+        Daily (04:30 local time, up to 1h random delay so a whole fleet doesn't hit
+        the ingest endpoint at once). Hardware identity (CPU/GPU/disk model) changes
+        rarely, so most fields won't move day to day - but location, network
+        attachment point, TPM/BitLocker/Defender state, and local admin membership
+        can all shift meaningfully within days, and this data is exactly what you'd
+        want on hand *after* a device goes missing. A weekly cadence means up to six
+        days of blind spot between a device's last-known-good report and it going
+        dark - daily bounds that gap to under a day, which matters far more here than
+        the wasted-request cost of re-collecting mostly-unchanged hardware facts.
 
         Runs as SYSTEM (S-1-5-18): dsregcmd /status and the CIM hardware queries used
         here don't strictly require it, but SYSTEM keeps this consistent with the
@@ -151,7 +155,7 @@ function Register-DeviceInventoryScheduledTask
     $arguments     = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -ConfigPath `"$configPath`""
 
     $action    = New-ScheduledTaskAction -Execute $powershellExe -Argument $arguments
-    $trigger   = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '04:30'
+    $trigger   = New-ScheduledTaskTrigger -Daily -At '04:30'
     $trigger.RandomDelay = 'PT1H'
     $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
     $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -176,7 +180,7 @@ function Register-DeviceInventoryScheduledTask
         throw "Scheduled task '$DeviceInventoryTaskName' was not present after registration."
     }
 
-    Write-ADTLogEntry -Message "Scheduled task '$DeviceInventoryTaskName' registered and verified (runs as SYSTEM, weekly Monday 04:30 + up to 1h random delay)."
+    Write-ADTLogEntry -Message "Scheduled task '$DeviceInventoryTaskName' registered and verified (runs as SYSTEM, daily 04:30 + up to 1h random delay)."
 }
 
 function Install-IngestClientCertificate
