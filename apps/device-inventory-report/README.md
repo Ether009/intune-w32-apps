@@ -1,10 +1,10 @@
 # Device Inventory Report
 
-Fills the one real gap in Dashhouse's device data: Microsoft Graph has no field for
-CPU model name on Intune-managed Windows devices. Everything else Dashhouse tracks
-(RAM, disk capacity, TPM, BitLocker status, signed-in users, ...) is pulled centrally
-by the existing Intune sync job - this app exists only for what that job structurally
-cannot get.
+Collects a comprehensive hardware/security/health snapshot that Microsoft Graph
+cannot provide for Intune-managed Windows devices, and reports it to the Dashhouse
+Admin UI. Everything Graph *can* expose (RAM, disk capacity, TPM version, BitLocker
+status, signed-in users) is already pulled centrally by Dashhouse's own Intune sync
+job - this app exists only for what that job structurally cannot get.
 
 Deployed to Intune as a Win32 app built with PSAppDeployToolkit v4.1.8.
 
@@ -15,55 +15,139 @@ Deployed to Intune as a Win32 app built with PSAppDeployToolkit v4.1.8.
 Once a week, **Monday at 04:30** (plus up to an hour of random delay so a whole fleet
 doesn't hit the ingest endpoint at once), a background task runs as SYSTEM and:
 
-1. Reads the device's Entra ID (Azure AD) device GUID from `dsregcmd /status`. This is
-   the same identifier Dashhouse's Intune sync already stores as `azure_ad_device_id`
-   (used to join sign-in data), so a report from this script lines up with a device's
-   existing row with no separate mapping step.
-2. Reads the CPU model name and core/thread count (`Win32_Processor`).
-3. Reads the GPU model name(s) (`Win32_VideoController`) - joined with a comma if a
-   device has more than one, e.g. integrated + discrete.
-4. Reads the primary (OS) disk's model and media type - SSD/HDD/Unspecified
-   (`Get-PhysicalDisk`), useful for upgrade/replace planning that RAM and capacity
-   alone don't answer.
-5. Posts the result as JSON to the Dashhouse Admin UI's ingest endpoint, authenticated
-   with a shared secret header.
+1. Reads the device's Entra ID (Azure AD) device GUID from `dsregcmd /status` - the
+   same identifier Dashhouse's Intune sync already stores as `azure_ad_device_id`, so
+   a report from this script lines up with a device's existing row with no separate
+   mapping step.
+2. Collects everything below.
+3. Posts the result as JSON to the Dashhouse Admin UI's ingest endpoint, authenticated
+   with a shared secret header. The endpoint upserts by device ID - no history is
+   kept for most fields, since most of this doesn't need one; child lists (network
+   adapters, local admins, monitors) are fully replaced each run rather than diffed.
 
 The install also runs the task once immediately, so a newly enrolled or newly updated
 device reports in right away rather than waiting up to a week.
 
-### Why weekly, not daily
+### What's collected
 
-CPU/GPU/disk identity changes rarely - only on a hardware swap. A daily cadence like
-the Intune sync (02:00) or profile cleanup (03:00) job would just be wasted requests
-against the ingest endpoint for data that isn't moving. Weekly is enough to catch a
-hardware change within a few days, and the run-once-on-install covers new devices
-immediately.
+**Component serials** - chassis, motherboard, BIOS/system, CPU (`ProcessorId` - the
+closest thing to a CPU serial Windows exposes; real per-chip serials were dropped
+after the Pentium III era), primary disk.
+
+**CPU/GPU** - model name, core/thread count, every connected GPU's model name.
+
+**TPM capabilities and attestation readiness** - present/enabled/activated/owned
+state, spec version, manufacturer, Endorsement Key certificate presence, and -
+crucially - `tpmReadyForAttestation` / `tpmCapableForAttestation`, read directly from
+`tpmtool.exe GetDeviceInformation`'s own fields. This is **Microsoft's own local
+determination**, not a guess assembled from raw TPM state: it's why a VM's virtual
+TPM correctly reports as not attestation-capable even though it can report TPM 2.0,
+enabled/activated/owned. Also captures `TPM Has Vulnerable Firmware` and the
+BitLocker PCR7 binding state from the same tool.
+
+**Firmware/boot mode** - whether Windows actually booted via UEFI or the legacy/CSM
+path (there's no OS-visible way to read "is CSM enabled" as a standalone firmware
+toggle; this reflects how Windows itself booted, which is the meaningful signal in
+practice), and Secure Boot state.
+
+**Disk health** - `HealthStatus` from Storage Management, plus SMART/reliability
+counters where supported: wear percentage (SSD), temperature, power-on hours,
+cumulative read/write error counts.
+
+**Network adapters** (one row per adapter with a MAC address) - name, MAC, media
+type, link speed, status, currently-connected SSID for wireless, and **network
+location**: IPv4 address, subnet prefix length, default gateway, and the gateway's
+MAC address (resolved via the ARP/neighbor cache) - useful for inferring which
+building/floor a device is on from which network segment it's connected to, since
+Windows has no direct physical-location API.
+
+**Geolocation** - a best-effort Windows Location API fix (GPS or Wi-Fi positioning),
+10-second timeout. Running as SYSTEM, this is normally expected to fail or time out,
+since location consent is usually an interactive per-user privacy setting SYSTEM
+doesn't have - but on this fleet it has been observed to succeed (presumably due to a
+tenant-wide location policy), so it's collected rather than assumed impossible.
+Denied/unavailable is a normal, logged outcome, not an error.
+
+**Local administrators** - every member of the local Administrators group (looked up
+by well-known SID `S-1-5-32-544`, not the localized group name - `Get-LocalGroupMember
+-Group 'Administrators'` fails outright on this fleet's Swedish-locale devices).
+Azure AD member SIDs are best-effort resolved to a UPN via the identity store cache;
+falls back to the raw SID when no cache entry exists (common for a group that's never
+itself signed in locally).
+
+**Defender status** - antivirus/real-time-protection enabled, signature age, last
+quick/full scan times. `$null` (not "protection off") on a device where a third-party
+AV has disabled Defender's engine entirely.
+
+**Pending reboot** - whether the standard Windows/WSUS/CBS registry markers indicate
+a restart is needed to finish applying an update.
+
+**Windows activation status** - filtered specifically to the Windows product (not
+Office or anything else that happens to have a license installed).
+
+**Battery health** - design capacity, current full-charge capacity, and cycle count,
+via `powercfg /batteryreport` rather than the per-vendor WMI battery classes (those
+were found unreliable in testing - one returned "Generic failure" on a normal,
+healthy battery). All-`$null` (not an error) on a desktop with no battery.
+
+**Connected monitors** - manufacturer/model/serial from EDID data. Laptop-internal
+panels frequently leave model/serial blank even when manufacturer is populated -
+that's a real limitation of what the panel itself reports, not a parsing failure.
+
+**Last boot time** - for spotting devices that never restart (and so never pick up
+patches requiring a reboot).
 
 ---
 
 ## Where the data goes
 
-`POST https://admin.dashhouse.kaijunet.se:8443/api/inventory`, upserted into the
-`device_extra_inventory` table by `azure_ad_device_id` (one row per device - no
-history is kept, since hardware identity doesn't need one). The endpoint checks an
-`X-Ingest-Key` header against a secret stored in the Admin UI's `.env`
-(`DEVICE_INGEST_KEY`) - this is machine-to-machine, so it doesn't go through the
-Entra ID SSO session auth the rest of the Admin UI uses.
+`POST https://admin.dashhouse.kaijunet.se:8443/api/inventory`, authenticated via an
+`X-Ingest-Key` header (secret stored in the Admin UI's `.env` as `DEVICE_INGEST_KEY`)
+rather than the Entra ID SSO session auth the rest of the Admin UI uses - this is
+machine-to-machine.
 
-To use the data in Grafana, join `device_extra_inventory` to `device_snapshots` on
-`azure_ad_device_id`:
+- **`device_extra_inventory`** - one row per device (upserted by `azure_ad_device_id`),
+  holding everything that isn't inherently a list: serials, TPM/firmware/BitLocker
+  state, disk health, Defender/activation/reboot state, battery, geolocation.
+- **`device_network_adapters`** - one row per adapter per device, replaced in full on
+  every report.
+- **`device_local_admins`** - one row per local-admin-group member per device,
+  replaced in full on every report.
+- **`device_monitors`** - one row per connected monitor per device, replaced in full
+  on every report.
+
+Join example for Grafana:
 
 ```sql
 SELECT ds.device_name, ds.manufacturer, ds.model,
-    dei.cpu_model, dei.cpu_cores, dei.gpu_model, dei.disk_model, dei.disk_media_type,
+    dei.cpu_model, dei.tpm_ready_for_attestation, dei.tpm_capable_for_attestation,
+    dei.disk_health_status, dei.disk_wear_percentage,
+    dei.pending_reboot, dei.windows_activation_status,
+    dei.defender_realtime_protection_enabled,
+    dei.battery_design_capacity_mwh, dei.battery_full_charge_capacity_mwh, dei.battery_cycle_count,
+    dei.location_latitude, dei.location_longitude,
     dei.received_at
 FROM device_snapshots ds
 LEFT JOIN device_extra_inventory dei ON dei.azure_ad_device_id = ds.azure_ad_device_id
 WHERE ds.id IN (SELECT MAX(id) FROM device_snapshots GROUP BY device_id)
 ```
 
-A device that hasn't run the task yet (not targeted by the app, or hasn't hit its
-weekly window) simply has `NULL`s from the join - not an error.
+A device that hasn't run the task yet simply has `NULL`s from the join - not an
+error.
+
+---
+
+## A note on "attestation ready"
+
+`tpmReadyForAttestation` / `tpmCapableForAttestation` come from `tpmtool.exe`'s own
+computation, which accounts for EK certificate validity and PCR bank state - this is
+authoritative, not a heuristic built here from raw TPM properties. It's still a
+local, offline check rather than a live round-trip to Microsoft's Device Directory
+Service, so on rare edge cases it can disagree with what an actual Autopilot
+enrollment attempt reports - but it's the same computation Windows itself uses to
+answer that question, not a guess. Confirmed in testing: a virtual TPM genuinely
+fails this check, which is exactly why VMs can't do self-deploying/white-glove
+Autopilot even though they happily report TPM 2.0/enabled/activated/owned.
 
 ---
 
@@ -108,22 +192,31 @@ it only reads hardware info and posts a report):
 & "$env:ProgramData\Organization\DeviceInventory\Get-DeviceInventory.ps1"
 ```
 
+Several fields (TPM state via `Get-Tpm`, Secure Boot, disk SMART/wear via
+`Get-StorageReliabilityCounter`) require admin - they'll log warnings and come back
+`$null`/`False` in an unelevated test shell even though they work correctly running
+as SYSTEM. Run the worker script from an elevated prompt to see real values while
+testing.
+
 ---
 
 ## Good to know
 
 - **Read-only on the device.** This app never modifies anything on the machine it
   runs on beyond its own install folder, registry key, and scheduled task - it only
-  reads hardware info and sends a report.
+  reads information and sends a report.
 - **A device with no Azure AD device ID is skipped, not reported with a blank ID.**
   Hybrid-joined or non-Entra devices where `dsregcmd /status` doesn't return a
-  `DeviceId` log a warning and exit without posting, rather than sending a report
-  Dashhouse couldn't correlate to anything.
-- **Multi-GPU devices report every GPU**, comma-separated, rather than picking one -
-  useful for devices with both integrated and discrete graphics.
-- **The primary disk is the one holding the OS partition**, identified via
-  `Win32_DiskPartition`/`Win32_LogicalDisk`, not just "whichever disk comes first" -
-  falls back to the first disk reported if that lookup fails for any reason.
+  `DeviceId` log a warning and exit without posting.
+- **NIC "serial number" isn't collected** - it isn't a real Windows/WMI concept.
+  The MAC address is the adapter's unique identifier and is what's collected instead.
+- **A run can take up to ~30-40 seconds**, mostly the Windows Location API's 10-second
+  timeout when it doesn't get an immediate fix. Well within the task's 15-minute
+  execution limit.
+- **Non-ASCII text (e.g. Swedish adapter names) requires explicit UTF-8 encoding of
+  the outbound request body** - Windows PowerShell 5.1's `Invoke-RestMethod` does not
+  reliably send a plain `[String]` body as UTF-8 on its own; the script encodes to
+  UTF-8 bytes explicitly before sending.
 
 ---
 
