@@ -1,52 +1,73 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Runs a short, fixed-work single-threaded CPU benchmark and reports the elapsed
-    time to the Dashhouse Admin UI, so relatively low-performing CPUs in the fleet
-    can be identified directly - CPU generation alone is a rough proxy, since two
-    CPUs from the same generation (a U-series vs a T-series SKU, for example) can
+    Runs a fixed-duration CPU throughput benchmark and reports the result to the
+    Dashhouse Admin UI, so relatively low-performing CPUs in the fleet can be
+    identified directly - CPU generation alone is a rough proxy, since two CPUs
+    from the same generation (a U-series vs a T-series SKU, for example) can
     still differ meaningfully in real throughput.
 
 .DESCRIPTION
-    Runs as NT AUTHORITY\SYSTEM from a scheduled task that Task Scheduler itself
-    only starts once the device has been idle for a while (a native "run only if
-    idle" trigger condition, not custom idle-detection code in this script - see
-    Register-CpuBenchmarkScheduledTask in Invoke-AppDeployToolkit.ps1 for why: this
-    script runs in session 0, where APIs like GetLastInputInfo() cannot see the
-    interactive user's session at all, so a hand-rolled idle check from in here
-    would silently be wrong). A benchmark competing with whatever the person using
-    the device is actually doing would both slow them down and produce a
-    meaningless result, so this script trusts Task Scheduler entirely for that and
-    has no idle logic of its own.
+    Invoked by two different scheduled tasks with different -DurationSeconds
+    values (see Register-CpuBenchmarkIdleScheduledTask and
+    Register-CpuBenchmarkForcedScheduledTask in Invoke-AppDeployToolkit.ps1):
+    a primary idle-gated task (120s/phase, high accuracy) and a weekly
+    not-idle-gated fallback (30s/phase, for devices that rarely go idle). The
+    idle-gated task relies entirely on Task Scheduler's own idle engine
+    (-RunOnlyIfIdle), not custom idle-detection code in this script - this runs
+    as NT AUTHORITY\SYSTEM in session 0, where APIs like GetLastInputInfo()
+    cannot see the interactive user's session at all, so a hand-rolled idle
+    check from in here would silently be wrong.
 
-    Measures two things, both fixed-work (not fixed-*duration*) SHA-256 hashing so
-    elapsed milliseconds is directly comparable across devices - lower is faster:
-      - Single-core: one thread, sequential.
-      - Multi-core: the same per-thread workload run N-way in parallel across every
-        logical processor. Total work scales with core count on purpose - a device
-        that can genuinely put more cores to use finishes sooner, which is the real
-        multi-core capability this is meant to capture, not something to normalize
-        away.
-    Neither is a portable/absolute benchmark score - both are relative fleet-ranking
-    signals only, not comparable to results from other tools.
+    Measures two things, both fixed-DURATION (not fixed-work) SHA-256 hashing
+    throughput, so the result is directly comparable across devices regardless
+    of core count or speed - higher MB/s is faster:
+      - Single-core: one thread, hashing in a loop for the full duration, total
+        MB hashed divided by elapsed seconds.
+      - Multi-core: the same per-thread loop run in parallel across every
+        logical processor, each for the same fixed duration; every worker's MB
+        hashed is summed and divided by elapsed seconds. This is deliberately
+        an aggregate-throughput measure, not an aggregate-latency one: a
+        fixed-WORK design (hash the same total amount, however many cores
+        share it) would reward two very fast cores over a thousand slower ones
+        even when the thousand-core machine can clearly do more total work per
+        second - summing each worker's independently-measured throughput over
+        a shared fixed duration avoids that, since more cores (even weaker
+        ones) can only add to the total, never subtract from it.
+      - Fixed duration rather than fixed work also matters for accuracy on its
+        own: a short burst mostly measures L1/L2 cache bandwidth and whatever
+        boost-clock the CPU can sustain for a few seconds, not the throughput
+        it can actually sustain - hence 120s on the accurate idle-gated task.
 
-    Posts the device ID and both measured times to a narrow endpoint
-    (`/api/inventory/benchmark`) that updates exactly those columns on the device's
-    existing inventory row. Deliberately not the same endpoint Get-DeviceInventory.ps1
-    uses - that one's UPDATE spans every column in its payload, so a small
-    benchmark-only POST through it would null out every other field this script does
-    not collect.
+    Neither is a portable/absolute benchmark score - both are relative fleet-
+    ranking signals only, not comparable to results from other tools.
+
+    Posts the device ID and both measured throughput values to a narrow
+    endpoint (`/api/inventory/benchmark`) that updates exactly those columns on
+    the device's existing inventory row. Deliberately not the same endpoint
+    Get-DeviceInventory.ps1 uses - that one's UPDATE spans every column in its
+    payload, so a small benchmark-only POST through it would null out every
+    other field this script does not collect. The endpoint keeps only the
+    highest score ever reported per device (a server-side ratchet, not
+    something this script needs to know about) - a run that happens to compete
+    with someone actively using the machine can only score the same or lower
+    than a genuinely uncontended run, so it can never corrupt a good reading,
+    only fail to beat it.
 
 .NOTES
     Deployed to disk by the PSADT Win32 app alongside Get-DeviceInventory.ps1;
-    invoked by the "Organization - CPU Benchmark" scheduled task. Harmless to run
-    manually/interactively for testing - it only measures local CPU throughput and
-    posts a two-field report.
+    invoked by the "Organization - CPU Benchmark" and "Organization - CPU
+    Benchmark (Weekly Forced)" scheduled tasks. Harmless to run
+    manually/interactively for testing - it only measures local CPU throughput
+    and posts a two-field report. A manual run pegs every logical processor for
+    -DurationSeconds seconds during the multi-core phase, so expect the machine
+    to be briefly sluggish while it's running.
 #>
 [CmdletBinding()]
 param (
     [String]$ConfigPath,
-    [String]$LogPath = (Join-Path $env:ProgramData 'Organization\DeviceInventory\Logs\Invoke-CpuBenchmark.log')
+    [String]$LogPath = (Join-Path $env:ProgramData 'Organization\DeviceInventory\Logs\Invoke-CpuBenchmark.log'),
+    [int]$DurationSeconds = 120
 )
 
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) { $ConfigPath = Join-Path $PSScriptRoot 'DeviceInventoryConfig.json' }
@@ -163,44 +184,55 @@ function Get-IngestClientCertificate {
     }
 }
 
-function Measure-CpuBenchmark {
+function Measure-CpuBenchmarkThroughput {
     <#
     .SYNOPSIS
-        Single-threaded, fixed-work SHA-256 hashing benchmark: hashes a 4MB buffer
-        50 times (200MB total) and times it. Fixed work rather than fixed duration,
-        so the result (elapsed ms) is directly comparable across devices - lower is
-        faster. Sized to take roughly a few seconds even on the oldest CPUs
-        currently in the fleet (4th/5th-gen Intel U-series) without running long
-        enough to matter if it's a bit off for a much newer or much older machine.
+        Single-threaded, fixed-DURATION SHA-256 hashing throughput benchmark:
+        repeatedly hashes a 4MB buffer for the full duration and reports MB/s -
+        higher is faster. Fixed duration rather than fixed work, deliberately: a
+        short fixed-work run mostly measures L1/L2 cache bandwidth and whatever
+        boost clock the CPU can sustain for a couple of seconds, not the
+        throughput it can actually sustain.
+    .PARAMETER DurationSeconds
+        How long to hash for.
     .OUTPUTS
-        [Double] elapsed milliseconds - lower is a faster CPU.
+        [Double] megabytes hashed per second - higher is faster.
     #>
-    $bufferSizeBytes = 4MB
-    $iterations = 50
+    param([Parameter(Mandatory)][int]$DurationSeconds)
 
+    $bufferSizeBytes = 4MB
     $buffer = New-Object byte[] $bufferSizeBytes
     (New-Object System.Random).NextBytes($buffer)
 
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
     try {
+        $bytesHashed = 0L
+        $limit = [TimeSpan]::FromSeconds($DurationSeconds)
         $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-        for ($i = 0; $i -lt $iterations; $i++) {
+        while ($stopwatch.Elapsed -lt $limit) {
             [void]$sha256.ComputeHash($buffer)
+            $bytesHashed += $bufferSizeBytes
         }
         $stopwatch.Stop()
     } finally {
         $sha256.Dispose()
     }
-    return $stopwatch.Elapsed.TotalMilliseconds
+    return ($bytesHashed / 1MB) / $stopwatch.Elapsed.TotalSeconds
 }
 
-function Measure-CpuBenchmarkMultiCore {
+function Measure-CpuBenchmarkMultiCoreThroughput {
     <#
     .SYNOPSIS
-        Same fixed-work SHA-256 hashing as Measure-CpuBenchmark, run N-way in
-        parallel (N = logical processor count) via a runspace pool - each worker
-        hashes its own independently-generated buffer, so there's no shared state
-        or synchronization between threads to skew the timing.
+        Same fixed-duration SHA-256 hashing as Measure-CpuBenchmarkThroughput, run
+        N-way in parallel (N = logical processor count) via a runspace pool for the
+        same fixed duration - each worker hashes its own independently-generated
+        buffer, so there's no shared state or synchronization between threads to
+        skew the timing. Every worker's MB hashed is summed and divided by the
+        overall elapsed time, giving an aggregate throughput figure: this rewards
+        more cores contributing more total work over the shared window, rather than
+        rewarding whichever configuration finishes a fixed amount of work soonest
+        (which would favor a few very fast cores over many slower ones, even when
+        the many-slower-core machine is clearly doing more total work per second).
 
         A runspace pool rather than PowerShell 7's `ForEach-Object -Parallel`
         because this targets Windows PowerShell 5.1 (same constraint as the rest of
@@ -209,20 +241,30 @@ function Measure-CpuBenchmarkMultiCore {
         of outer-scope variables across threads is a known PowerShell footgun -
         explicit -AddArgument to each worker's own script instance sidesteps it
         entirely.
+    .PARAMETER DurationSeconds
+        How long each worker hashes for.
     .OUTPUTS
-        [Double] wall-clock elapsed milliseconds for every worker to finish its own
-        50-iteration hashing pass - lower is faster/more capable.
+        [Double] aggregate megabytes hashed per second across every logical
+        processor - higher is faster/more capable.
     #>
+    param([Parameter(Mandatory)][int]$DurationSeconds)
+
     $processorCount = [Math]::Max(1, [Environment]::ProcessorCount)
-    $iterationsPerWorker = 50
 
     $workerScript = {
-        param($BufferSizeBytes, $Iterations)
+        param($BufferSizeBytes, $DurationSeconds)
         $buffer = New-Object byte[] $BufferSizeBytes
         (New-Object System.Random).NextBytes($buffer)
         $sha256 = [System.Security.Cryptography.SHA256]::Create()
         try {
-            for ($i = 0; $i -lt $Iterations; $i++) { [void]$sha256.ComputeHash($buffer) }
+            $bytesHashed = 0L
+            $limit = [TimeSpan]::FromSeconds($DurationSeconds)
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($stopwatch.Elapsed -lt $limit) {
+                [void]$sha256.ComputeHash($buffer)
+                $bytesHashed += $BufferSizeBytes
+            }
+            return $bytesHashed
         } finally {
             $sha256.Dispose()
         }
@@ -236,11 +278,12 @@ function Measure-CpuBenchmarkMultiCore {
         for ($i = 0; $i -lt $processorCount; $i++) {
             $shell = [powershell]::Create()
             $shell.RunspacePool = $pool
-            [void]$shell.AddScript($workerScript).AddArgument(4MB).AddArgument($iterationsPerWorker)
+            [void]$shell.AddScript($workerScript).AddArgument(4MB).AddArgument($DurationSeconds)
             $workers += [pscustomobject]@{ Shell = $shell; Handle = $shell.BeginInvoke() }
         }
+        $totalBytesHashed = 0L
         foreach ($worker in $workers) {
-            $worker.Shell.EndInvoke($worker.Handle) | Out-Null
+            $totalBytesHashed += ($worker.Shell.EndInvoke($worker.Handle))[0]
         }
         $stopwatch.Stop()
     } finally {
@@ -248,11 +291,11 @@ function Measure-CpuBenchmarkMultiCore {
         $pool.Close()
         $pool.Dispose()
     }
-    return $stopwatch.Elapsed.TotalMilliseconds
+    return ($totalBytesHashed / 1MB) / $stopwatch.Elapsed.TotalSeconds
 }
 
 #region Main
-Write-BenchmarkLog -Message 'Starting CPU benchmark run (Task Scheduler only starts this task once the device has been idle).'
+Write-BenchmarkLog -Message "Starting CPU benchmark run (DurationSeconds=$DurationSeconds per phase)."
 
 $config = Read-BenchmarkConfigFile -Path $ConfigPath
 if (-not $config -or -not $config.BenchmarkUrl) {
@@ -273,16 +316,16 @@ if (-not $azureAdDeviceId) {
     exit 1
 }
 
-$singleCoreMs = [Math]::Round((Measure-CpuBenchmark), 1)
-Write-BenchmarkLog -Message "Single-core benchmark complete: $singleCoreMs ms."
+$singleCoreMBps = [Math]::Round((Measure-CpuBenchmarkThroughput -DurationSeconds $DurationSeconds), 2)
+Write-BenchmarkLog -Message "Single-core benchmark complete: $singleCoreMBps MB/s."
 
-$multiCoreMs = [Math]::Round((Measure-CpuBenchmarkMultiCore), 1)
-Write-BenchmarkLog -Message "Multi-core benchmark complete ($([Environment]::ProcessorCount) logical processors): $multiCoreMs ms."
+$multiCoreMBps = [Math]::Round((Measure-CpuBenchmarkMultiCoreThroughput -DurationSeconds $DurationSeconds), 2)
+Write-BenchmarkLog -Message "Multi-core benchmark complete ($([Environment]::ProcessorCount) logical processors): $multiCoreMBps MB/s aggregate."
 
 $payload = [pscustomobject]@{
-    azureAdDeviceId       = $azureAdDeviceId
-    cpuBenchmarkMs        = $singleCoreMs
-    cpuBenchmarkMultiCoreMs = $multiCoreMs
+    azureAdDeviceId                = $azureAdDeviceId
+    cpuBenchmarkScoreMBps          = $singleCoreMBps
+    cpuBenchmarkMultiCoreScoreMBps = $multiCoreMBps
 } | ConvertTo-Json -Compress
 
 # Explicit UTF-8 byte encoding - Windows PowerShell 5.1's Invoke-RestMethod does not

@@ -694,6 +694,50 @@ function Get-NetworkAdapterInventory {
     return $adapters
 }
 
+function Get-WinSatInventory {
+    <#
+    .SYNOPSIS
+        Reads Windows' own cached WinSAT (Windows System Assessment Tool) hardware
+        performance scores via the Win32_WinSAT CIM class - a free supplementary
+        signal alongside the CPU throughput benchmark (Invoke-CpuBenchmark.ps1),
+        since Windows already computes and caches these; no benchmark runs here,
+        just an instant read. Not capturing WinSPRLevel ("the overall score") -
+        it's just MIN() of the five component scores below, so it's redundant to
+        store separately; trivially recomputable from these if ever wanted.
+
+        This is a snapshot from whenever WinSAT last ran - often once, near first
+        boot/imaging - so on an older device it can reflect hardware state from
+        years ago (e.g. before a RAM upgrade), not necessarily today's. Treat as a
+        free corroborating signal, not a substitute for the CPU throughput
+        benchmark, which is deliberately measured fresh every run.
+    .OUTPUTS
+        [pscustomobject] { CpuScore; D3dScore; DiskScore; GraphicsScore;
+        MemoryScore; AssessmentState } - all $null/'Unknown' if WinSAT has never
+        run or the class is unavailable on this SKU.
+    #>
+    $result = [pscustomobject]@{
+        CpuScore = $null; D3dScore = $null; DiskScore = $null; GraphicsScore = $null
+        MemoryScore = $null; AssessmentState = $null
+    }
+    try {
+        $winsat = Get-CimInstance -ClassName Win32_WinSAT -ErrorAction Stop
+        if ($winsat) {
+            # Win32_WinSAT's own documented WINSAT_ASSESSMENT_STATE enum.
+            $stateMap = @{ 0 = 'Unknown'; 1 = 'Valid'; 2 = 'IncoherentWithHardware'; 3 = 'NoAssessmentAvailable'; 4 = 'Invalid' }
+            $result.CpuScore = $winsat.CPUScore
+            $result.D3dScore = $winsat.D3DScore
+            $result.DiskScore = $winsat.DiskScore
+            $result.GraphicsScore = $winsat.GraphicsScore
+            $result.MemoryScore = $winsat.MemoryScore
+            $state = [int]$winsat.WinSATAssessmentState
+            $result.AssessmentState = if ($stateMap.ContainsKey($state)) { $stateMap[$state] } else { 'Unknown' }
+        }
+    } catch {
+        Write-InventoryLog -Severity Warning -Message "WinSAT lookup failed: $_"
+    }
+    return $result
+}
+
 function Get-GeoLocation {
     <#
     .SYNOPSIS
@@ -840,6 +884,7 @@ $battery = Get-BatteryInventory
 $monitors = Get-MonitorInventory
 $lastBootTimeUtc = Get-LastBootTimeUtc
 $geoLocation = Get-GeoLocation
+$winsat = Get-WinSatInventory
 
 $collectedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
 
@@ -895,6 +940,12 @@ $payload = @{
     locationLongitude         = $geoLocation.Longitude
     locationAccuracyMeters    = $geoLocation.AccuracyMeters
     locationSource            = $geoLocation.Source
+    winsatCpuScore            = $winsat.CpuScore
+    winsatD3dScore            = $winsat.D3dScore
+    winsatDiskScore           = $winsat.DiskScore
+    winsatGraphicsScore       = $winsat.GraphicsScore
+    winsatMemoryScore         = $winsat.MemoryScore
+    winsatAssessmentState     = $winsat.AssessmentState
     collectedAtUtc           = $collectedAtUtc
     networkAdapters          = @($networkAdapters | ForEach-Object {
         @{
