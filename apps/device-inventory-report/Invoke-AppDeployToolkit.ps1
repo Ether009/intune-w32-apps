@@ -98,14 +98,14 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Organization'
     AppName = 'Device Inventory Report'
-    AppVersion = '3.2.0'
+    AppVersion = '3.3.0'
     AppArch = ''
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '3.2.0'
+    AppScriptVersion = '3.3.0'
     AppScriptDate = '2026-08-01'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -131,6 +131,7 @@ $DeviceInventoryTaskName = 'Organization - Device Inventory Report'
 $DeviceInventoryRegKey = 'HKLM:\SOFTWARE\Organization\DeviceInventory'
 $DeviceInventoryBenchmarkScriptFileName = 'Invoke-CpuBenchmark.ps1'
 $DeviceInventoryBenchmarkTaskName = 'Organization - CPU Benchmark'
+$DeviceInventoryBenchmarkForcedTaskName = 'Organization - CPU Benchmark (Weekly Forced)'
 
 
 function Register-DeviceInventoryScheduledTask
@@ -185,7 +186,7 @@ function Register-DeviceInventoryScheduledTask
     Write-ADTLogEntry -Message "Scheduled task '$DeviceInventoryTaskName' registered and verified (runs as SYSTEM, daily 04:30 + up to 1h random delay)."
 }
 
-function Register-CpuBenchmarkScheduledTask
+function Register-CpuBenchmarkIdleScheduledTask
 {
     <#
         Idle-triggered rather than time-triggered: Task Scheduler itself gates this
@@ -203,21 +204,24 @@ function Register-CpuBenchmarkScheduledTask
         (unlike the inventory task above) - forcing it to run during an Intune push
         would defeat the entire point of waiting for idle.
 
-        The benchmark itself is a few seconds of single-threaded work, not worth
-        interrupting if the device stops being idle mid-run, so RestartOnIdle /
-        StopOnIdleEnd are left at their defaults (the task is not stopped early).
+        120 seconds per phase (see -DurationSeconds below): short fixed-work runs
+        mostly measure L1/L2 cache bandwidth and CPU boost-clock behavior rather
+        than sustained throughput, so this is deliberately long enough to run past
+        both. This is the accurate, primary reading - see
+        Register-CpuBenchmarkForcedScheduledTask for the shorter weekly fallback
+        that covers devices this idle trigger rarely catches.
     #>
     $powershellExe = Join-Path $env:WinDir 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $scriptPath    = Join-Path $DeviceInventoryInstallDir $DeviceInventoryBenchmarkScriptFileName
     $configPath    = Join-Path $DeviceInventoryInstallDir $DeviceInventoryConfigFileName
-    $arguments     = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -ConfigPath `"$configPath`""
+    $arguments     = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -ConfigPath `"$configPath`" -DurationSeconds 120"
 
     $action    = New-ScheduledTaskAction -Execute $powershellExe -Argument $arguments
     $trigger   = New-ScheduledTaskTrigger -Daily -At '10:00'
     $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
     $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                     -Hidden -StartWhenAvailable -MultipleInstances IgnoreNew `
-                    -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+                    -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
                     -RunOnlyIfIdle -IdleDuration (New-TimeSpan -Minutes 10) -IdleWaitTimeout (New-TimeSpan -Hours 20)
 
     if (Get-ScheduledTask -TaskName $DeviceInventoryBenchmarkTaskName -ErrorAction SilentlyContinue)
@@ -228,7 +232,7 @@ function Register-CpuBenchmarkScheduledTask
 
     Register-ScheduledTask -TaskName $DeviceInventoryBenchmarkTaskName -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings `
-        -Description 'Runs a short CPU benchmark once the device has been idle for a while and reports the result to Dashhouse. Deployed by Organization IT.' | Out-Null
+        -Description 'Runs a 120s/phase CPU throughput benchmark once the device has been idle for a while and reports the result to Dashhouse. Deployed by Organization IT.' | Out-Null
 
     # Same reasoning as the inventory task's post-registration check: fail the
     # install visibly rather than silently leave nothing scheduled.
@@ -237,7 +241,69 @@ function Register-CpuBenchmarkScheduledTask
         throw "Scheduled task '$DeviceInventoryBenchmarkTaskName' was not present after registration."
     }
 
-    Write-ADTLogEntry -Message "Scheduled task '$DeviceInventoryBenchmarkTaskName' registered and verified (idle-triggered, daily wait window starting 10:00)."
+    Write-ADTLogEntry -Message "Scheduled task '$DeviceInventoryBenchmarkTaskName' registered and verified (idle-triggered, 120s/phase, daily wait window starting 10:00)."
+}
+
+function Register-CpuBenchmarkForcedScheduledTask
+{
+    <#
+        Weekly fallback for the idle-gated benchmark above: runs regardless of idle
+        state, so a device that's rarely or never idle still gets at least one
+        throughput reading. The ingest endpoint keeps only the highest score ever
+        reported per device (server-side MAX ratchet - see /api/inventory/benchmark),
+        so a run that happens to compete with someone actively using the machine can
+        only score the same or lower than a genuinely idle run: it can never corrupt
+        a good reading, only fail to beat it. Over enough weekly samples this
+        converges toward the same number the idle trigger would have found, for
+        devices the idle trigger alone can't reach.
+
+        Deliberately shorter than the idle task (30s/phase vs. 120s/phase) since this
+        one may run while someone is actively working - minimizing how long it can
+        visibly slow the device down matters more here than measurement precision,
+        which the idle-gated task above already covers.
+
+        Monday 13:00 was chosen deliberately: the start of a regular
+        organization-wide short meeting, when most workstations are logged in and
+        running but very few people are actively working at their computer (laptops
+        carried to the meeting won't be present, but that's fine - they're more
+        likely to satisfy the idle-gated task's own trigger on their own).
+
+        RandomDelay serves two purposes: it spreads the fleet's near-simultaneous
+        13:00 trigger over a window instead of every device posting to the ingest
+        endpoint in the same second, and it is what keeps a *missed* trigger (device
+        was off/asleep at 13:00 Monday, so StartWhenAvailable's catch-up fires this
+        at next boot instead) from launching straight into a fresh boot's startup
+        storm - the delay applies to a catch-up fire the same as a scheduled one.
+    #>
+    $powershellExe = Join-Path $env:WinDir 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $scriptPath    = Join-Path $DeviceInventoryInstallDir $DeviceInventoryBenchmarkScriptFileName
+    $configPath    = Join-Path $DeviceInventoryInstallDir $DeviceInventoryConfigFileName
+    $arguments     = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -ConfigPath `"$configPath`" -DurationSeconds 30"
+
+    $action    = New-ScheduledTaskAction -Execute $powershellExe -Argument $arguments
+    $trigger   = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '13:00'
+    $trigger.RandomDelay = 'PT15M'
+    $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                    -Hidden -StartWhenAvailable -MultipleInstances IgnoreNew `
+                    -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+
+    if (Get-ScheduledTask -TaskName $DeviceInventoryBenchmarkForcedTaskName -ErrorAction SilentlyContinue)
+    {
+        Write-ADTLogEntry -Message "Scheduled task '$DeviceInventoryBenchmarkForcedTaskName' already exists; replacing it."
+        Unregister-ScheduledTask -TaskName $DeviceInventoryBenchmarkForcedTaskName -Confirm:$false
+    }
+
+    Register-ScheduledTask -TaskName $DeviceInventoryBenchmarkForcedTaskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings `
+        -Description 'Weekly fallback CPU throughput benchmark (30s/phase, not idle-gated) for devices the idle-triggered benchmark rarely catches. Deployed by Organization IT.' | Out-Null
+
+    if (-not (Get-ScheduledTask -TaskName $DeviceInventoryBenchmarkForcedTaskName -ErrorAction SilentlyContinue))
+    {
+        throw "Scheduled task '$DeviceInventoryBenchmarkForcedTaskName' was not present after registration."
+    }
+
+    Write-ADTLogEntry -Message "Scheduled task '$DeviceInventoryBenchmarkForcedTaskName' registered and verified (weekly Monday 13:00 + up to 15min random delay, 30s/phase, not idle-gated)."
 }
 
 function Install-IngestClientCertificate
@@ -323,7 +389,8 @@ function Install-ADTDeployment
 
     Install-IngestClientCertificate
     Register-DeviceInventoryScheduledTask
-    Register-CpuBenchmarkScheduledTask
+    Register-CpuBenchmarkIdleScheduledTask
+    Register-CpuBenchmarkForcedScheduledTask
     Set-ADTRegistryKey -Key $DeviceInventoryRegKey -Name 'Version' -Value $adtSession.AppVersion -Type String
 
     # Run the inventory task once immediately so a newly enrolled or newly updated
@@ -352,10 +419,13 @@ function Uninstall-ADTDeployment
     ##================================================
     $adtSession.InstallPhase = $adtSession.DeploymentType
 
-    if (Get-ScheduledTask -TaskName $DeviceInventoryTaskName -ErrorAction SilentlyContinue)
+    foreach ($taskName in @($DeviceInventoryTaskName, $DeviceInventoryBenchmarkTaskName, $DeviceInventoryBenchmarkForcedTaskName))
     {
-        Write-ADTLogEntry -Message "Removing scheduled task '$DeviceInventoryTaskName'."
-        Unregister-ScheduledTask -TaskName $DeviceInventoryTaskName -Confirm:$false
+        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)
+        {
+            Write-ADTLogEntry -Message "Removing scheduled task '$taskName'."
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+        }
     }
 
     Get-ChildItem -Path 'Cert:\LocalMachine\My' -ErrorAction SilentlyContinue |
