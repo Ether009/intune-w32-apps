@@ -1,5 +1,6 @@
 {
-  "Version": "3.1.0",
+  "Version": "3.2.0",
   "IngestUrl": "https://admin.dashhouse.kaijunet.se:8443/api/inventory",
+  "BenchmarkUrl": "https://admin.dashhouse.kaijunet.se:8443/api/inventory/benchmark",
   "IngestClientCertSubjectCn": "dashhouse-device-ingest-client"
 }

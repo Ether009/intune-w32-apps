@@ -98,15 +98,15 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Organization'
     AppName = 'Device Inventory Report'
-    AppVersion = '3.1.0'
+    AppVersion = '3.2.0'
     AppArch = ''
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '3.1.0'
-    AppScriptDate = '2026-07-31'
+    AppScriptVersion = '3.2.0'
+    AppScriptDate = '2026-08-01'
     AppScriptAuthor = ''
     RequireAdmin = $true
 
@@ -129,6 +129,8 @@ $DeviceInventoryScriptFileName = 'Get-DeviceInventory.ps1'
 $DeviceInventoryConfigFileName = 'DeviceInventoryConfig.json'
 $DeviceInventoryTaskName = 'Organization - Device Inventory Report'
 $DeviceInventoryRegKey = 'HKLM:\SOFTWARE\Organization\DeviceInventory'
+$DeviceInventoryBenchmarkScriptFileName = 'Invoke-CpuBenchmark.ps1'
+$DeviceInventoryBenchmarkTaskName = 'Organization - CPU Benchmark'
 
 
 function Register-DeviceInventoryScheduledTask
@@ -181,6 +183,61 @@ function Register-DeviceInventoryScheduledTask
     }
 
     Write-ADTLogEntry -Message "Scheduled task '$DeviceInventoryTaskName' registered and verified (runs as SYSTEM, daily 04:30 + up to 1h random delay)."
+}
+
+function Register-CpuBenchmarkScheduledTask
+{
+    <#
+        Idle-triggered rather than time-triggered: Task Scheduler itself gates this
+        on the device being idle (-RunOnlyIfIdle), which is the correct way to
+        detect idle from a task running as SYSTEM. GetLastInputInfo() and similar
+        APIs, called from a SYSTEM process in session 0, cannot see the interactive
+        user's session input at all - a hand-rolled idle check from inside the
+        worker script would silently be wrong. Task Scheduler's own idle engine has
+        no such blind spot.
+
+        The daily trigger time below is only when Task Scheduler starts *waiting*
+        for idle, not when the benchmark runs - IdleWaitTimeout gives it up to 20
+        hours from that point to catch an idle window before giving up until the
+        next day's trigger. Deliberately NOT started immediately at install time
+        (unlike the inventory task above) - forcing it to run during an Intune push
+        would defeat the entire point of waiting for idle.
+
+        The benchmark itself is a few seconds of single-threaded work, not worth
+        interrupting if the device stops being idle mid-run, so RestartOnIdle /
+        StopOnIdleEnd are left at their defaults (the task is not stopped early).
+    #>
+    $powershellExe = Join-Path $env:WinDir 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $scriptPath    = Join-Path $DeviceInventoryInstallDir $DeviceInventoryBenchmarkScriptFileName
+    $configPath    = Join-Path $DeviceInventoryInstallDir $DeviceInventoryConfigFileName
+    $arguments     = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -ConfigPath `"$configPath`""
+
+    $action    = New-ScheduledTaskAction -Execute $powershellExe -Argument $arguments
+    $trigger   = New-ScheduledTaskTrigger -Daily -At '10:00'
+    $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                    -Hidden -StartWhenAvailable -MultipleInstances IgnoreNew `
+                    -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+                    -RunOnlyIfIdle -IdleDuration (New-TimeSpan -Minutes 10) -IdleWaitTimeout (New-TimeSpan -Hours 20)
+
+    if (Get-ScheduledTask -TaskName $DeviceInventoryBenchmarkTaskName -ErrorAction SilentlyContinue)
+    {
+        Write-ADTLogEntry -Message "Scheduled task '$DeviceInventoryBenchmarkTaskName' already exists; replacing it."
+        Unregister-ScheduledTask -TaskName $DeviceInventoryBenchmarkTaskName -Confirm:$false
+    }
+
+    Register-ScheduledTask -TaskName $DeviceInventoryBenchmarkTaskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings `
+        -Description 'Runs a short CPU benchmark once the device has been idle for a while and reports the result to Dashhouse. Deployed by Organization IT.' | Out-Null
+
+    # Same reasoning as the inventory task's post-registration check: fail the
+    # install visibly rather than silently leave nothing scheduled.
+    if (-not (Get-ScheduledTask -TaskName $DeviceInventoryBenchmarkTaskName -ErrorAction SilentlyContinue))
+    {
+        throw "Scheduled task '$DeviceInventoryBenchmarkTaskName' was not present after registration."
+    }
+
+    Write-ADTLogEntry -Message "Scheduled task '$DeviceInventoryBenchmarkTaskName' registered and verified (idle-triggered, daily wait window starting 10:00)."
 }
 
 function Install-IngestClientCertificate
@@ -255,6 +312,7 @@ function Install-ADTDeployment
         New-Item -Path $DeviceInventoryInstallDir -ItemType Directory -Force | Out-Null
     }
     Copy-ADTFile -Path "$($adtSession.DirSupportFiles)\$DeviceInventoryScriptFileName" -Destination $DeviceInventoryInstallDir
+    Copy-ADTFile -Path "$($adtSession.DirSupportFiles)\$DeviceInventoryBenchmarkScriptFileName" -Destination $DeviceInventoryInstallDir
     Copy-ADTFile -Path "$($adtSession.DirSupportFiles)\$DeviceInventoryConfigFileName" -Destination $DeviceInventoryInstallDir
 
 
@@ -265,10 +323,14 @@ function Install-ADTDeployment
 
     Install-IngestClientCertificate
     Register-DeviceInventoryScheduledTask
+    Register-CpuBenchmarkScheduledTask
     Set-ADTRegistryKey -Key $DeviceInventoryRegKey -Name 'Version' -Value $adtSession.AppVersion -Type String
 
-    # Run once immediately so a newly enrolled or newly updated device reports in
-    # right away rather than waiting up to a week for the next scheduled run.
+    # Run the inventory task once immediately so a newly enrolled or newly updated
+    # device reports in right away rather than waiting up to a day for the next
+    # scheduled run. The benchmark task is deliberately NOT started here - it waits
+    # for its own idle-gated trigger; forcing it to run during an Intune push would
+    # defeat the entire point.
     Start-ScheduledTask -TaskName $DeviceInventoryTaskName -ErrorAction SilentlyContinue
 }
 

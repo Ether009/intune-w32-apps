@@ -774,12 +774,13 @@ function Get-IngestClientCertificate {
         lives in a PUBLIC GitHub repo, and a static shared-secret approach was tried
         first and had to be abandoned after it leaked that way.
 
-        The certificate is expected to be delivered separately, by an Intune
-        Certificate profile (PKCS-imported, a shared cert across the fleet) assigned
-        to the same device group as this app - see this app's README for the exact
-        setup. Intune's certificate delivery is a native MDM feature, not a script,
-        so it isn't subject to the reliability problems ordinary PowerShell-based
-        delivery (Platform scripts / Proactive Remediations) can have.
+        The certificate is delivered by this app's own installer
+        (Install-IngestClientCertificate in Invoke-AppDeployToolkit.ps1), which
+        imports a PFX injected into the package at CI build time from GitHub repo
+        secrets - see this app's README, "Ingest authentication", for the full
+        design and why an Intune Certificate profile was considered and ruled out
+        (both PKCS variants require the Certificate Connector for Microsoft Intune,
+        which needs Windows Server infrastructure this org doesn't have).
     .PARAMETER SubjectCn
         The certificate's expected Subject Common Name.
     .OUTPUTS

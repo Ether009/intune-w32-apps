@@ -29,6 +29,9 @@ fleet doesn't hit the ingest endpoint at once), a background task runs as SYSTEM
 The install also runs the task once immediately, so a newly enrolled or newly updated
 device reports in right away rather than waiting for the next scheduled run.
 
+A second, separate scheduled task also runs a short CPU benchmark, but only once the
+device has gone idle - see *CPU benchmark* below.
+
 **Why daily, not weekly:** most hardware identity fields (CPU/GPU/disk model) barely
 change day to day, but this app also collects things that can - location, which
 network the device is attached to, TPM/BitLocker/Defender state, local admin
@@ -104,6 +107,42 @@ that's a real limitation of what the panel itself reports, not a parsing failure
 
 **Last boot time** - for spotting devices that never restart (and so never pick up
 patches requiring a reboot).
+
+---
+
+## CPU benchmark (idle-gated, separate task)
+
+CPU generation alone is a rough proxy for how fast a device actually is - two CPUs
+from the same generation (a U-series vs a T-series SKU, for example) can still
+differ meaningfully. A second scheduled task, **"Organization - CPU Benchmark"**,
+measures this directly:
+
+- **Idle-triggered, not time-triggered.** Task Scheduler's own `-RunOnlyIfIdle`
+  condition gates this, not custom idle-detection code - a script running as SYSTEM
+  is in session 0, where APIs like `GetLastInputInfo()` can't see the interactive
+  user's session at all, so a hand-rolled check would silently be wrong. The daily
+  trigger (10:00) is only when Task Scheduler starts *waiting* for an idle window;
+  `IdleWaitTimeout` gives it 20 hours to find one before giving up until the next
+  day. Not started immediately at install time (unlike the inventory task) -
+  forcing it to run during an Intune push would defeat the entire point.
+- **Measures both single-core and multi-core throughput** - fixed-work (not
+  fixed-duration) SHA-256 hashing, so elapsed milliseconds is directly comparable
+  across devices: lower is faster. Multi-core runs the same per-thread workload
+  N-way in parallel (N = logical processor count) via a runspace pool; total work
+  scales with core count on purpose, since a device that can genuinely put more
+  cores to use should finish sooner - that's the real capability being measured,
+  not something to normalize away. Neither number is a portable/absolute benchmark
+  score - both are relative fleet-ranking signals only.
+- **Posts to a narrow endpoint**, `/api/inventory/benchmark`, not the main
+  `/api/inventory` endpoint - that one's UPDATE spans every column in its payload,
+  so a small benchmark-only POST through it would null out every other field this
+  script doesn't collect. The narrow endpoint touches exactly `cpu_benchmark_ms`,
+  `cpu_benchmark_multicore_ms`, and `cpu_benchmark_collected_at_utc`, and requires
+  the device's inventory row to already exist (the daily inventory task always runs
+  first).
+- Worker script: `SupportFiles/Invoke-CpuBenchmark.ps1`. Logs to
+  `Invoke-CpuBenchmark.log` (separate from the main inventory log, so the two
+  scripts never contend over rotating the same file).
 
 ---
 
@@ -228,8 +267,9 @@ Edit **`SupportFiles/DeviceInventoryConfig.json`**. No PowerShell changes needed
 
 | Setting | What it does |
 |---|---|
-| `IngestUrl` | The Admin UI's ingest endpoint. |
-| `IngestClientCertSubjectCn` | The Subject CN of the client certificate to use for mutual TLS (see *Ingest authentication* above) - identifies which certificate to use, not a secret itself. |
+| `IngestUrl` | The Admin UI's main ingest endpoint. |
+| `BenchmarkUrl` | The Admin UI's narrow benchmark-result endpoint (see *CPU benchmark* above). |
+| `IngestClientCertSubjectCn` | The Subject CN of the client certificate to use for mutual TLS (see *Ingest authentication* above) - identifies which certificate to use, not a secret itself. Shared by both endpoints. |
 
 ### Rolling out a change
 
@@ -294,9 +334,10 @@ testing.
 ## Files in this folder
 
 ```
-Invoke-AppDeployToolkit.ps1        the installer (registers the scheduled task)
+Invoke-AppDeployToolkit.ps1        the installer (registers both scheduled tasks)
 SupportFiles/
   Get-DeviceInventory.ps1           what runs each day
+  Invoke-CpuBenchmark.ps1           what runs once the device is idle
   DeviceInventoryConfig.json         the settings you'll actually edit
 manifest.json                      which Intune app this publishes to
 ```
