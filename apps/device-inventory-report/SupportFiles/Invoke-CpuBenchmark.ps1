@@ -19,27 +19,34 @@
     cannot see the interactive user's session at all, so a hand-rolled idle
     check from in here would silently be wrong.
 
-    Measures two things, both fixed-DURATION (not fixed-work) SHA-256 hashing
-    throughput, so the result is directly comparable across devices regardless
-    of core count or speed - higher MB/s is faster:
-      - Single-core: one thread, hashing in a loop for the full duration, total
-        MB hashed divided by elapsed seconds.
+    Measures two things, both fixed-DURATION (not fixed-work) throughput
+    calculating digits of pi via the classic Rabinowitz-Wagon spigot algorithm
+    (arbitrary-precision integer arithmetic, System.Numerics.BigInteger) -
+    higher digits/sec is faster:
+      - Single-core: one thread, calculating in a loop for the full duration,
+        total digits produced divided by elapsed seconds.
       - Multi-core: the same per-thread loop run in parallel across every
-        logical processor, each for the same fixed duration; every worker's MB
-        hashed is summed and divided by elapsed seconds. This is deliberately
-        an aggregate-throughput measure, not an aggregate-latency one: a
-        fixed-WORK design (hash the same total amount, however many cores
-        share it) would reward two very fast cores over a thousand slower ones
-        even when the thousand-core machine can clearly do more total work per
-        second - summing each worker's independently-measured throughput over
-        a shared fixed duration avoids that, since more cores (even weaker
-        ones) can only add to the total, never subtract from it.
-      - Fixed duration rather than fixed work also matters for accuracy on its
-        own: a short burst mostly measures L1/L2 cache bandwidth and whatever
-        boost-clock the CPU can sustain for a few seconds, not the throughput
-        it can actually sustain - hence 120s on the accurate idle-gated task.
+        logical processor, each for the same fixed duration; every worker's
+        digit count is summed and divided by elapsed seconds. This is
+        deliberately an aggregate-throughput measure, not an aggregate-latency
+        one - see Measure-PiDigitsMultiCoreThroughput below for why.
 
-    Neither is a portable/absolute benchmark score - both are relative fleet-
+    Deliberately NOT a cryptographic hash (SHA-256 in an earlier version of
+    this script): mainstream CPUs since roughly 2019 (Ice Lake mobile onward on
+    Intel, Zen onward on AMD) have hardware SHA acceleration (SHA-NI), while
+    the fleet's many pre-2019 Skylake-generation machines do not. That made the
+    old benchmark measure "does this CPU have a crypto accelerator" nearly as
+    much as "is this CPU fast", which skews exactly the comparison this
+    benchmark exists to make. Pi-digit calculation is pure arbitrary-precision
+    arithmetic with no dedicated instruction-set fast path on any consumer
+    CPU - only generic ALU/FPU throughput, which every x86 CPU since the
+    386/487 era has had in some form, so it stays a genuine general-compute
+    comparison across CPU generations. Methodology (fixed-duration,
+    aggregate-throughput scoring) follows Crazegi/Pi-Bench-Tool
+    (https://github.com/Crazegi/Pi-Bench-Tool), reimplemented here in
+    PowerShell rather than reusing its Python code.
+
+    Neither score is a portable/absolute benchmark - both are relative fleet-
     ranking signals only, not comparable to results from other tools.
 
     Posts the device ID and both measured throughput values to a narrow
@@ -184,55 +191,73 @@ function Get-IngestClientCertificate {
     }
 }
 
-function Measure-CpuBenchmarkThroughput {
+function Measure-PiDigitsThroughput {
     <#
     .SYNOPSIS
-        Single-threaded, fixed-DURATION SHA-256 hashing throughput benchmark:
-        repeatedly hashes a 4MB buffer for the full duration and reports MB/s -
-        higher is faster. Fixed duration rather than fixed work, deliberately: a
-        short fixed-work run mostly measures L1/L2 cache bandwidth and whatever
-        boost clock the CPU can sustain for a couple of seconds, not the
-        throughput it can actually sustain.
+        Single-threaded, fixed-DURATION pi-digit calculation throughput benchmark:
+        computes digits of pi via the Rabinowitz-Wagon streaming spigot algorithm
+        (arbitrary-precision integer arithmetic, no dedicated CPU instruction-set
+        fast path) for the full duration and reports digits/sec - higher is
+        faster. Fixed duration rather than fixed digit count, deliberately: a
+        short run mostly measures whatever boost clock the CPU can sustain for a
+        couple of seconds, not the throughput it can actually sustain, and the
+        per-digit cost grows as the working numbers get larger, so a fixed count
+        would not be directly comparable across CPUs anyway.
     .PARAMETER DurationSeconds
-        How long to hash for.
+        How long to calculate for.
     .OUTPUTS
-        [Double] megabytes hashed per second - higher is faster.
+        [Double] pi digits calculated per second - higher is faster.
     #>
     param([Parameter(Mandatory)][int]$DurationSeconds)
 
-    $bufferSizeBytes = 4MB
-    $buffer = New-Object byte[] $bufferSizeBytes
-    (New-Object System.Random).NextBytes($buffer)
+    Add-Type -AssemblyName System.Numerics -ErrorAction SilentlyContinue
 
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $bytesHashed = 0L
-        $limit = [TimeSpan]::FromSeconds($DurationSeconds)
-        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-        while ($stopwatch.Elapsed -lt $limit) {
-            [void]$sha256.ComputeHash($buffer)
-            $bytesHashed += $bufferSizeBytes
+    [System.Numerics.BigInteger]$q = 1
+    [System.Numerics.BigInteger]$r = 0
+    [System.Numerics.BigInteger]$t = 1
+    [System.Numerics.BigInteger]$k = 1
+    [System.Numerics.BigInteger]$n = 3
+    [System.Numerics.BigInteger]$l = 3
+    $digitsCalculated = 0L
+
+    $limit = [TimeSpan]::FromSeconds($DurationSeconds)
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($stopwatch.Elapsed -lt $limit) {
+        if (($q * 4 + $r - $t) -lt ($n * $t)) {
+            $digitsCalculated++
+            $nr = ($r - $n * $t) * 10
+            $n = ((($q * 3 + $r) * 10) / $t) - $n * 10
+            $q *= 10
+            $r = $nr
+        } else {
+            $nr = ($q * 2 + $r) * $l
+            $nn = ($q * ($k * 7 + 2) + $r * $l) / ($t * $l)
+            $q *= $k
+            $t *= $l
+            $l += 2
+            $k += 1
+            $n = $nn
+            $r = $nr
         }
-        $stopwatch.Stop()
-    } finally {
-        $sha256.Dispose()
     }
-    return ($bytesHashed / 1MB) / $stopwatch.Elapsed.TotalSeconds
+    $stopwatch.Stop()
+    return $digitsCalculated / $stopwatch.Elapsed.TotalSeconds
 }
 
-function Measure-CpuBenchmarkMultiCoreThroughput {
+function Measure-PiDigitsMultiCoreThroughput {
     <#
     .SYNOPSIS
-        Same fixed-duration SHA-256 hashing as Measure-CpuBenchmarkThroughput, run
+        Same fixed-duration pi-digit calculation as Measure-PiDigitsThroughput, run
         N-way in parallel (N = logical processor count) via a runspace pool for the
-        same fixed duration - each worker hashes its own independently-generated
-        buffer, so there's no shared state or synchronization between threads to
-        skew the timing. Every worker's MB hashed is summed and divided by the
+        same fixed duration - each worker maintains its own independent spigot
+        state, so there's no shared state or synchronization between threads to
+        skew the timing. Every worker's digit count is summed and divided by the
         overall elapsed time, giving an aggregate throughput figure: this rewards
-        more cores contributing more total work over the shared window, rather than
-        rewarding whichever configuration finishes a fixed amount of work soonest
-        (which would favor a few very fast cores over many slower ones, even when
-        the many-slower-core machine is clearly doing more total work per second).
+        more cores contributing more total work over the shared window, rather
+        than rewarding whichever configuration finishes a fixed amount of work
+        soonest (which would favor a few very fast cores over many slower ones,
+        even when the many-slower-core machine is clearly doing more total work
+        per second).
 
         A runspace pool rather than PowerShell 7's `ForEach-Object -Parallel`
         because this targets Windows PowerShell 5.1 (same constraint as the rest of
@@ -242,9 +267,9 @@ function Measure-CpuBenchmarkMultiCoreThroughput {
         explicit -AddArgument to each worker's own script instance sidesteps it
         entirely.
     .PARAMETER DurationSeconds
-        How long each worker hashes for.
+        How long each worker calculates for.
     .OUTPUTS
-        [Double] aggregate megabytes hashed per second across every logical
+        [Double] aggregate pi digits calculated per second across every logical
         processor - higher is faster/more capable.
     #>
     param([Parameter(Mandatory)][int]$DurationSeconds)
@@ -252,22 +277,36 @@ function Measure-CpuBenchmarkMultiCoreThroughput {
     $processorCount = [Math]::Max(1, [Environment]::ProcessorCount)
 
     $workerScript = {
-        param($BufferSizeBytes, $DurationSeconds)
-        $buffer = New-Object byte[] $BufferSizeBytes
-        (New-Object System.Random).NextBytes($buffer)
-        $sha256 = [System.Security.Cryptography.SHA256]::Create()
-        try {
-            $bytesHashed = 0L
-            $limit = [TimeSpan]::FromSeconds($DurationSeconds)
-            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-            while ($stopwatch.Elapsed -lt $limit) {
-                [void]$sha256.ComputeHash($buffer)
-                $bytesHashed += $BufferSizeBytes
+        param($DurationSeconds)
+        Add-Type -AssemblyName System.Numerics -ErrorAction SilentlyContinue
+        [System.Numerics.BigInteger]$q = 1
+        [System.Numerics.BigInteger]$r = 0
+        [System.Numerics.BigInteger]$t = 1
+        [System.Numerics.BigInteger]$k = 1
+        [System.Numerics.BigInteger]$n = 3
+        [System.Numerics.BigInteger]$l = 3
+        $digitsCalculated = 0L
+        $limit = [TimeSpan]::FromSeconds($DurationSeconds)
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($stopwatch.Elapsed -lt $limit) {
+            if (($q * 4 + $r - $t) -lt ($n * $t)) {
+                $digitsCalculated++
+                $nr = ($r - $n * $t) * 10
+                $n = ((($q * 3 + $r) * 10) / $t) - $n * 10
+                $q *= 10
+                $r = $nr
+            } else {
+                $nr = ($q * 2 + $r) * $l
+                $nn = ($q * ($k * 7 + 2) + $r * $l) / ($t * $l)
+                $q *= $k
+                $t *= $l
+                $l += 2
+                $k += 1
+                $n = $nn
+                $r = $nr
             }
-            return $bytesHashed
-        } finally {
-            $sha256.Dispose()
         }
+        return $digitsCalculated
     }
 
     $pool = [runspacefactory]::CreateRunspacePool(1, $processorCount)
@@ -278,12 +317,12 @@ function Measure-CpuBenchmarkMultiCoreThroughput {
         for ($i = 0; $i -lt $processorCount; $i++) {
             $shell = [powershell]::Create()
             $shell.RunspacePool = $pool
-            [void]$shell.AddScript($workerScript).AddArgument(4MB).AddArgument($DurationSeconds)
+            [void]$shell.AddScript($workerScript).AddArgument($DurationSeconds)
             $workers += [pscustomobject]@{ Shell = $shell; Handle = $shell.BeginInvoke() }
         }
-        $totalBytesHashed = 0L
+        $totalDigits = 0L
         foreach ($worker in $workers) {
-            $totalBytesHashed += ($worker.Shell.EndInvoke($worker.Handle))[0]
+            $totalDigits += ($worker.Shell.EndInvoke($worker.Handle))[0]
         }
         $stopwatch.Stop()
     } finally {
@@ -291,7 +330,7 @@ function Measure-CpuBenchmarkMultiCoreThroughput {
         $pool.Close()
         $pool.Dispose()
     }
-    return ($totalBytesHashed / 1MB) / $stopwatch.Elapsed.TotalSeconds
+    return $totalDigits / $stopwatch.Elapsed.TotalSeconds
 }
 
 #region Main
@@ -316,16 +355,16 @@ if (-not $azureAdDeviceId) {
     exit 1
 }
 
-$singleCoreMBps = [Math]::Round((Measure-CpuBenchmarkThroughput -DurationSeconds $DurationSeconds), 2)
-Write-BenchmarkLog -Message "Single-core benchmark complete: $singleCoreMBps MB/s."
+$singleCoreScore = [Math]::Round((Measure-PiDigitsThroughput -DurationSeconds $DurationSeconds), 2)
+Write-BenchmarkLog -Message "Single-core benchmark complete: $singleCoreScore pi digits/sec."
 
-$multiCoreMBps = [Math]::Round((Measure-CpuBenchmarkMultiCoreThroughput -DurationSeconds $DurationSeconds), 2)
-Write-BenchmarkLog -Message "Multi-core benchmark complete ($([Environment]::ProcessorCount) logical processors): $multiCoreMBps MB/s aggregate."
+$multiCoreScore = [Math]::Round((Measure-PiDigitsMultiCoreThroughput -DurationSeconds $DurationSeconds), 2)
+Write-BenchmarkLog -Message "Multi-core benchmark complete ($([Environment]::ProcessorCount) logical processors): $multiCoreScore pi digits/sec aggregate."
 
 $payload = [pscustomobject]@{
-    azureAdDeviceId                = $azureAdDeviceId
-    cpuBenchmarkScoreMBps          = $singleCoreMBps
-    cpuBenchmarkMultiCoreScoreMBps = $multiCoreMBps
+    azureAdDeviceId       = $azureAdDeviceId
+    cpuBenchmarkScore      = $singleCoreScore
+    cpuBenchmarkMultiCoreScore = $multiCoreScore
 } | ConvertTo-Json -Compress
 
 # Explicit UTF-8 byte encoding - Windows PowerShell 5.1's Invoke-RestMethod does not
