@@ -18,3 +18,6 @@ apps/*/Invoke-AppDeployToolkit.exe
 # guards against it ever landing here from local testing.
 apps/device-inventory-report/SupportFiles/client-cert.pfx
 apps/device-inventory-report/SupportFiles/client-cert.pfx.pw
+
+# Local-only credential notes - never committed
+secret.md
