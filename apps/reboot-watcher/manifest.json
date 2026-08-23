@@ -1,0 +1,6 @@
+{
+  "displayName": "Reboot Watcher",
+  "intuneAppId": "316cdc38-381e-45cd-9b60-76a5efda5d6c",
+  "detectionRegistryPath": "HKLM:\\SOFTWARE\\LundsFontanhus\\RebootWatcher",
+  "detectionRegistryValueName": "Version"
+}

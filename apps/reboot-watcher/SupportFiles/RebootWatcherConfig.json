@@ -1,0 +1,9 @@
+{
+  "WarningThresholdDays": 14,
+  "ForceRebootThresholdDays": 30,
+  "ForceRebootDelaySeconds": 600,
+  "OrganizationName": "Lunds Fontänhus",
+  "BalloonTitle": "Lunds Fontänhus IT - Säkerhetsvarning",
+  "BalloonMessage": "Den här datorn har varit igång i {0} dagar utan omstart. Starta om datorn så snart som möjligt av säkerhetsskäl - viktiga säkerhetsuppdateringar installeras inte förrän datorn har startats om.",
+  "ForceRebootMessage": "Lunds Fontänhus IT: Den här datorn har inte startats om på {0} dagar, vilket är en säkerhetsrisk. Datorn startas om automatiskt om 10 minuter av säkerhetsskäl - spara ditt arbete nu."
+}
