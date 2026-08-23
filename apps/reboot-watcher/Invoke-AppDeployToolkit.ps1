@@ -99,14 +99,14 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Lunds Fontänhus'
     AppName = 'Reboot Watcher'
-    AppVersion = '1.0.3'
+    AppVersion = '1.0.4'
     AppArch = ''
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.0.3'
+    AppScriptVersion = '1.0.4'
     AppScriptDate = '2026-08-23'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -145,29 +145,30 @@ function Register-RebootWatcherCheckScheduledTask
         whichever user is signed in. Hourly so a device that crosses either threshold
         is caught within an hour, not up to a day later.
 
-        A single "Once, starting now" trigger with an indefinite hourly repetition
-        (rather than -Daily/-At) both runs the first check immediately at install and
-        keeps repeating forever - Register-ScheduledTask has no direct "run every N
-        hours forever" trigger shape, this is the standard workaround.
+        Uses -Daily (with hourly repetition layered inside each day), not -Once with
+        an indefinite/long repetition - two prior attempts at the latter (first an
+        omitted -RepetitionDuration, then an explicit ~10-year one) both registered
+        and verified successfully, ran once, then had the task silently vanish from
+        Task Scheduler within minutes on a real test device, with nothing in the
+        (disabled-by-default) Task Scheduler operational log or the Security log to
+        explain it. The common thread across both failures: -Once is fundamentally a
+        one-time TriggerType to Task Scheduler no matter how its repetition pattern
+        is configured, and Windows appears to garbage-collect such tasks once it
+        considers their single base occurrence "used up" - independent of the
+        repetition duration layered on top. -AtLogOn (the notify task below) is a
+        genuinely recurring trigger type and has never exhibited this; switching the
+        check task to -Daily (also genuinely recurring - it fires again the next day
+        regardless of today's repetition window) sidesteps the entire failure class
+        rather than tuning duration values further. The install's own explicit
+        Start-ScheduledTask call (see Install-ADTDeployment) is what makes the first
+        check run immediately, independent of this trigger's daily anchor time.
 
-        Repetition is set via -RepetitionInterval on New-ScheduledTaskTrigger itself,
-        not by assigning $trigger.Repetition.Interval after the fact - the latter
-        throws "The property 'Interval' cannot be found on this object" on current
-        Windows builds, because $trigger.Repetition is $null until the cmdlet's own
-        -RepetitionInterval/-RepetitionDuration parameters populate it. Confirmed by
-        reproducing the failure locally (this is exactly what broke the first real
-        install attempt).
-
-        -RepetitionDuration is passed an explicit ~10-year span rather than either
-        extreme: [TimeSpan]::MaxValue serializes to an out-of-range ISO8601 duration
-        the Task Scheduler XML schema rejects outright, while omitting -RepetitionDuration
-        entirely - despite being the documented way to mean "repeat indefinitely" -
-        was observed on a real test device to let the task quietly vanish from Task
-        Scheduler shortly after its first run (confirmed reproducible: the task was
-        present immediately after Register-ScheduledTask and after the install's own
-        Start-ScheduledTask call, then gone a few minutes later with no trace in the
-        Task Scheduler operational log). An explicit long duration sidesteps whatever
-        that undocumented expiry behavior is.
+        Repetition is set via a manually-built CimInstance assigned to
+        $trigger.Repetition, not via -RepetitionInterval/-RepetitionDuration on
+        New-ScheduledTaskTrigger - -Daily has no such cmdlet parameters (only -Once
+        does). Duration is bounded to just under 24h (not indefinite) so the day's
+        repetition cleanly hands off to the next day's own base occurrence rather
+        than the two overlapping.
     #>
     $powershellExe = Join-Path $env:WinDir 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $scriptPath    = Join-Path $RebootWatcherInstallDir $RebootWatcherCheckScriptFileName
@@ -175,7 +176,9 @@ function Register-RebootWatcherCheckScheduledTask
     $arguments     = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -ConfigPath `"$configPath`""
 
     $action    = New-ScheduledTaskAction -Execute $powershellExe -Argument $arguments
-    $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+    $trigger   = New-ScheduledTaskTrigger -Daily -At '00:00'
+    $repetitionClass = Get-CimClass -ClassName MSFT_TaskRepetitionPattern -Namespace 'Root/Microsoft/Windows/TaskScheduler'
+    $trigger.Repetition = New-CimInstance -CimClass $repetitionClass -ClientOnly -Property @{ Interval = 'PT1H'; Duration = 'PT23H59M'; StopAtDurationEnd = $true }
     $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
     $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                     -Hidden -StartWhenAvailable -MultipleInstances IgnoreNew `
