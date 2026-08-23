@@ -99,14 +99,14 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Lunds Fontänhus'
     AppName = 'Reboot Watcher'
-    AppVersion = '1.0.1'
+    AppVersion = '1.0.2'
     AppArch = ''
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.0.1'
+    AppScriptVersion = '1.0.2'
     AppScriptDate = '2026-08-23'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -149,6 +149,17 @@ function Register-RebootWatcherCheckScheduledTask
         (rather than -Daily/-At) both runs the first check immediately at install and
         keeps repeating forever - Register-ScheduledTask has no direct "run every N
         hours forever" trigger shape, this is the standard workaround.
+
+        Repetition is set via -RepetitionInterval on New-ScheduledTaskTrigger itself,
+        not by assigning $trigger.Repetition.Interval after the fact - the latter
+        throws "The property 'Interval' cannot be found on this object" on current
+        Windows builds, because $trigger.Repetition is $null until the cmdlet's own
+        -RepetitionInterval/-RepetitionDuration parameters populate it. Confirmed by
+        reproducing the failure locally (this is exactly what broke the first real
+        install attempt). -RepetitionDuration is deliberately omitted rather than
+        passed as [TimeSpan]::MaxValue - that value serializes to an out-of-range
+        ISO8601 duration the Task Scheduler XML schema rejects; omitting it is the
+        documented way to mean "repeat indefinitely".
     #>
     $powershellExe = Join-Path $env:WinDir 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $scriptPath    = Join-Path $RebootWatcherInstallDir $RebootWatcherCheckScriptFileName
@@ -156,9 +167,7 @@ function Register-RebootWatcherCheckScheduledTask
     $arguments     = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -ConfigPath `"$configPath`""
 
     $action    = New-ScheduledTaskAction -Execute $powershellExe -Argument $arguments
-    $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date)
-    $trigger.Repetition.Interval = 'PT1H'
-    $trigger.Repetition.Duration = ''
+    $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1)
     $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
     $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                     -Hidden -StartWhenAvailable -MultipleInstances IgnoreNew `
@@ -191,14 +200,25 @@ function Register-RebootWatcherNotifyScheduledTask
         Unlike the check task above, this one must run inside the interactive user's
         own session - System.Windows.Forms.NotifyIcon has no way to raise a systray
         balloon into a session it isn't running in, and Session 0 (where a SYSTEM task
-        runs) has no desktop to render one on at all. -GroupId 'BUILTIN\Users' with
-        LogonType Group runs the task as whichever user triggers it, in their own
-        session, without needing to hard-code a specific user account.
+        runs) has no desktop to render one on at all. -GroupId runs the task as
+        whichever user triggers it, in their own session, without needing to
+        hard-code a specific user account - the well-known SID S-1-5-32-545 is used
+        instead of the literal name 'BUILTIN\Users' because Register-ScheduledTask
+        fails to resolve that localized name ("no mapping between account names and
+        security IDs") on this fleet's Swedish-locale devices, the same class of
+        issue documented in device-inventory-report's README for local-group lookups.
+        -LogonType is deliberately not passed alongside -GroupId - New-ScheduledTaskPrincipal
+        only accepts that combination as an error ("Parameter set cannot be resolved");
+        LogonType Group is implied by -GroupId on its own.
 
         Triggered at logon (so a user who's been signed in for days still gets caught
         promptly after their next logon) plus an indefinite 4-hour repetition, so a
         long-running session without a logoff/logon cycle still gets periodic reminders
-        once the warning threshold is active.
+        once the warning threshold is active. -AtLogOn has no -RepetitionInterval
+        cmdlet parameter (unlike -Once), so the repetition pattern is built as its own
+        CimInstance and assigned to $trigger.Repetition wholesale, rather than trying
+        to set .Repetition.Interval on the existing (null) Repetition property - see
+        the check task above for why the latter throws.
     #>
     $powershellExe = Join-Path $env:WinDir 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $scriptPath    = Join-Path $RebootWatcherInstallDir $RebootWatcherNotifyScriptFileName
@@ -209,9 +229,9 @@ function Register-RebootWatcherNotifyScheduledTask
     $action    = New-ScheduledTaskAction -Execute $powershellExe -Argument $arguments
     $trigger   = New-ScheduledTaskTrigger -AtLogOn
     $trigger.Delay = 'PT1M'  # let the profile/Explorer finish loading before the tray host is ready for a NotifyIcon
-    $trigger.Repetition.Interval = 'PT4H'
-    $trigger.Repetition.Duration = ''
-    $principal = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\Users' -LogonType Group -RunLevel Limited
+    $repetitionClass = Get-CimClass -ClassName MSFT_TaskRepetitionPattern -Namespace 'Root/Microsoft/Windows/TaskScheduler'
+    $trigger.Repetition = New-CimInstance -CimClass $repetitionClass -ClientOnly -Property @{ Interval = 'PT4H'; Duration = ''; StopAtDurationEnd = $false }
+    $principal = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited
     $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                     -Hidden -StartWhenAvailable -MultipleInstances IgnoreNew `
                     -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
