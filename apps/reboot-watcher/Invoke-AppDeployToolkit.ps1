@@ -99,14 +99,14 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Lunds Fontänhus'
     AppName = 'Reboot Watcher'
-    AppVersion = '1.0.0'
+    AppVersion = '1.0.1'
     AppArch = ''
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.0.0'
+    AppScriptVersion = '1.0.1'
     AppScriptDate = '2026-08-23'
     AppScriptAuthor = ''
     RequireAdmin = $true
