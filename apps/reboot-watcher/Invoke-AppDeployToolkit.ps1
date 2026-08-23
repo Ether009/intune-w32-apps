@@ -99,14 +99,14 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Lunds Fontänhus'
     AppName = 'Reboot Watcher'
-    AppVersion = '1.0.2'
+    AppVersion = '1.0.3'
     AppArch = ''
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.0.2'
+    AppScriptVersion = '1.0.3'
     AppScriptDate = '2026-08-23'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -156,10 +156,18 @@ function Register-RebootWatcherCheckScheduledTask
         Windows builds, because $trigger.Repetition is $null until the cmdlet's own
         -RepetitionInterval/-RepetitionDuration parameters populate it. Confirmed by
         reproducing the failure locally (this is exactly what broke the first real
-        install attempt). -RepetitionDuration is deliberately omitted rather than
-        passed as [TimeSpan]::MaxValue - that value serializes to an out-of-range
-        ISO8601 duration the Task Scheduler XML schema rejects; omitting it is the
-        documented way to mean "repeat indefinitely".
+        install attempt).
+
+        -RepetitionDuration is passed an explicit ~10-year span rather than either
+        extreme: [TimeSpan]::MaxValue serializes to an out-of-range ISO8601 duration
+        the Task Scheduler XML schema rejects outright, while omitting -RepetitionDuration
+        entirely - despite being the documented way to mean "repeat indefinitely" -
+        was observed on a real test device to let the task quietly vanish from Task
+        Scheduler shortly after its first run (confirmed reproducible: the task was
+        present immediately after Register-ScheduledTask and after the install's own
+        Start-ScheduledTask call, then gone a few minutes later with no trace in the
+        Task Scheduler operational log). An explicit long duration sidesteps whatever
+        that undocumented expiry behavior is.
     #>
     $powershellExe = Join-Path $env:WinDir 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $scriptPath    = Join-Path $RebootWatcherInstallDir $RebootWatcherCheckScriptFileName
@@ -167,7 +175,7 @@ function Register-RebootWatcherCheckScheduledTask
     $arguments     = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -ConfigPath `"$configPath`""
 
     $action    = New-ScheduledTaskAction -Execute $powershellExe -Argument $arguments
-    $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1)
+    $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Days 3650)
     $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
     $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                     -Hidden -StartWhenAvailable -MultipleInstances IgnoreNew `
@@ -218,7 +226,10 @@ function Register-RebootWatcherNotifyScheduledTask
         cmdlet parameter (unlike -Once), so the repetition pattern is built as its own
         CimInstance and assigned to $trigger.Repetition wholesale, rather than trying
         to set .Repetition.Interval on the existing (null) Repetition property - see
-        the check task above for why the latter throws.
+        the check task above for why the latter throws. Duration is set to an
+        explicit ~10-year span, not left blank, for the same reason as the check
+        task's -RepetitionDuration above - an empty/omitted duration was observed to
+        let a task quietly vanish from Task Scheduler shortly after its first run.
     #>
     $powershellExe = Join-Path $env:WinDir 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $scriptPath    = Join-Path $RebootWatcherInstallDir $RebootWatcherNotifyScriptFileName
@@ -230,7 +241,7 @@ function Register-RebootWatcherNotifyScheduledTask
     $trigger   = New-ScheduledTaskTrigger -AtLogOn
     $trigger.Delay = 'PT1M'  # let the profile/Explorer finish loading before the tray host is ready for a NotifyIcon
     $repetitionClass = Get-CimClass -ClassName MSFT_TaskRepetitionPattern -Namespace 'Root/Microsoft/Windows/TaskScheduler'
-    $trigger.Repetition = New-CimInstance -CimClass $repetitionClass -ClientOnly -Property @{ Interval = 'PT4H'; Duration = ''; StopAtDurationEnd = $false }
+    $trigger.Repetition = New-CimInstance -CimClass $repetitionClass -ClientOnly -Property @{ Interval = 'PT4H'; Duration = 'P3650D'; StopAtDurationEnd = $false }
     $principal = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited
     $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                     -Hidden -StartWhenAvailable -MultipleInstances IgnoreNew `
