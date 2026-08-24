@@ -13,6 +13,8 @@ env:
   PSADT_TEMPLATE_SHA256: '50CB8D32973FC7648060A48CAD63912ECB5CACA5A70754F37E83AA06BD380283'
   PREP_TOOL_URL: 'https://github.com/microsoft/Microsoft-Win32-Content-Prep-Tool/raw/master/IntuneWinAppUtil.exe'
   PREP_TOOL_SHA256: 'C1BA45B5CB939E84AF064BB7FF4B38FB3DFE33C8DC1078FD9B157672EAE671F6'
+  HP_CMSL_INSTALLER_URL: 'https://hpia.hpcloud.hp.com/downloads/cmsl/hp-cmsl-1.9.0.exe'
+  HP_CMSL_INSTALLER_SHA256: '73CEC61DE075AD0F3471383C7590A245632FEC08372ED5FC30549F0E9B28FDC0'
 
 jobs:
   discover:
@@ -116,6 +118,26 @@ jobs:
           [System.IO.File]::WriteAllBytes((Join-Path $supportFiles 'client-cert.pfx'), [Convert]::FromBase64String($env:CLIENT_PFX_BASE64))
           [System.IO.File]::WriteAllText((Join-Path $supportFiles 'client-cert.pfx.pw'), $env:CLIENT_PFX_PASSWORD, [Text.Encoding]::UTF8)
           "[$env:APP_DIR] Ingest client certificate injected into staged package."
+
+      # hp-cmsl's SupportFiles are deliberately empty in source control - the HP
+      # CMSL installer is a ~23MB HP-signed binary, so it's downloaded here from
+      # HP's official endpoint and verified against a pinned SHA-256, the same
+      # way the PSADT template and content prep tool above are, rather than
+      # being committed to the repo. Update HP_CMSL_INSTALLER_URL/_SHA256 (and
+      # bump this app's AppVersion) to ship a newer HP CMSL release.
+      - name: Inject HP CMSL installer
+        if: matrix.app == 'hp-cmsl'
+        shell: powershell
+        env:
+          APP_DIR: ${{ matrix.app }}
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $staging = Join-Path $env:RUNNER_TEMP "staging-$env:APP_DIR"
+          $dest = Join-Path $staging 'SupportFiles\hp-cmsl-installer.exe'
+          Invoke-WebRequest -Uri $env:HP_CMSL_INSTALLER_URL -OutFile $dest -UseBasicParsing
+          $hash = (Get-FileHash -Path $dest -Algorithm SHA256).Hash
+          if ($hash -ne $env:HP_CMSL_INSTALLER_SHA256) { throw "HP CMSL installer hash mismatch: got $hash" }
+          "[$env:APP_DIR] HP CMSL installer staged and hash-verified."
 
       - name: Build .intunewin
         shell: powershell

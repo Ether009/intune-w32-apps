@@ -1,0 +1,6 @@
+{
+  "displayName": "HP Client Management Script Library",
+  "intuneAppId": "ef5253af-d765-4182-aa1d-991f43561bd0",
+  "detectionRegistryPath": "HKLM:\\SOFTWARE\\Organization\\HPCMSL",
+  "detectionRegistryValueName": "Version"
+}
