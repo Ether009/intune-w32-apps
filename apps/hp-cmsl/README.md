@@ -46,15 +46,12 @@ locally hand-assembled test build (extracting the PSADT template yourself instea
 letting CI do it) won't have the real installer, so `Install-HpCmslScriptLibrary`
 throws a clear error rather than silently doing nothing.
 
-### First rollout
-
-`AppVersion` starts at `1.0.1` - one bump above the Intune app object's placeholder
-`1.0.0` displayVersion - rather than at `1.9.0` (the actual HP CMSL version this
-package ships) on purpose: it's an independent rollout counter, not the HP CMSL
-version, so if something needs fixing after the first publish there's room to bump it
-again (`1.0.2`, ...) without already being pinned at the real target version. Once
-this app is confirmed working end-to-end on a test device, bump `AppVersion` to `1.9.0`
-to match the HP CMSL release it ships, and keep the two in lockstep from then on.
+Note: the app was initially rolled out with `AppVersion` at `1.0.1` (one bump above the
+Intune app object's placeholder `1.0.0` displayVersion) rather than jumping straight to
+`1.9.0`, so a fix could be republished without already being pinned at the real target
+version. That first rollout was confirmed working end-to-end on a test device -
+`AppVersion` is now at `1.9.0`, matching the HP CMSL release actually shipped, and the
+two are kept in lockstep from here on.
 
 ### Updating to a newer HP CMSL release
 

@@ -97,14 +97,14 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Organization'
     AppName = 'HP Client Management Script Library'
-    AppVersion = '1.0.1'
+    AppVersion = '1.9.0'
     AppArch = ''
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.0.1'
+    AppScriptVersion = '1.9.0'
     AppScriptDate = '2026-08-24'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -122,14 +122,11 @@ $adtSession = @{
 # Framework-specific names, shared by the functions below. AppVersion above is
 # an independent rollout counter, not the HP CMSL version - it's just the
 # value written to the detection registry key and compared against Intune's
-# displayVersion to decide whether to publish. The Intune app object was
-# created with a placeholder displayVersion of 1.0.0, so this starts one bump
-# above that (1.0.1) rather than at the actual shipped HP CMSL version (1.9.0,
-# see HP_CMSL_INSTALLER_URL in build-and-publish.yml) - that leaves room to
-# bump again (1.0.2, ...) for a fix without first having to land on the real
-# target version. Once this app is confirmed working end-to-end, bump
-# AppVersion to match the HP CMSL version it ships (1.9.0) and keep the two in
-# lockstep from then on.
+# displayVersion to decide whether to publish. Confirmed working end-to-end on
+# a test device at 1.0.1; now at parity with the actual HP CMSL version this
+# package ships (see HP_CMSL_INSTALLER_URL in build-and-publish.yml) - keep
+# the two in lockstep going forward (bump AppVersion to match whenever the
+# pinned installer URL/hash changes).
 $HpCmslInstallerFileName = 'hp-cmsl-installer.exe'
 $HpCmslDisplayName = 'HP Client Management Script Library'
 $HpCmslRegKey = 'HKLM:\SOFTWARE\Organization\HPCMSL'
