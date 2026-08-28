@@ -1,0 +1,6 @@
+{
+  "displayName": "Microsoft 365 Apps for Windows 10 and later (Win32)",
+  "intuneAppId": "a0b39507-bab0-47eb-8926-7c1da89c68cc",
+  "detectionRegistryPath": "HKLM:\\SOFTWARE\\Organization\\OfficeM365AppsWin32",
+  "detectionRegistryValueName": "Version"
+}

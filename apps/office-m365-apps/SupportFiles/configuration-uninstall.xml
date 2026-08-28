@@ -1,0 +1,4 @@
+<Configuration>
+  <Display Level="None" AcceptEULA="TRUE" />
+  <Remove All="TRUE" />
+</Configuration>
