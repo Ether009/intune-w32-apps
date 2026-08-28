@@ -105,7 +105,7 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Microsoft'
     AppName = 'Microsoft 365 Apps for Windows 10 and later (Win32)'
-    AppVersion = '1.0.0'
+    AppVersion = '1.0.1'
     AppArch = 'x64'
     AppLang = 'EN'
     AppRevision = '01'
@@ -155,9 +155,13 @@ function Install-ADTDeployment
     ##================================================
     $adtSession.InstallPhase = "Pre-$($adtSession.DeploymentType)"
 
-    ## Office refuses to install silently while its own apps are open with unsaved
-    ## work could be lost - close them first, same as any other Office deployment.
-    Show-ADTInstallationWelcome -CloseProcesses $adtSession.AppProcessesToClose -CloseProcessesCountdown 60
+    ## This is a background, unattended Required install on devices with no signed-in
+    ## user (self-deploying Autopilot) - there's nobody there to see or dismiss a
+    ## "close these apps" prompt, so Show-ADTInstallationWelcome is intentionally not
+    ## called here (unlike a typical interactive Office deployment). A stray prompt
+    ## with no one to answer it just sits until the toolkit's own countdown times out,
+    ## which reads as a failed/stuck install. AppProcessesToClose above is kept for
+    ## documentation of what Office itself would ask about, not acted on.
 
 
     ##================================================
@@ -201,7 +205,8 @@ function Uninstall-ADTDeployment
     ##================================================
     $adtSession.InstallPhase = "Pre-$($adtSession.DeploymentType)"
 
-    Show-ADTInstallationWelcome -CloseProcesses $adtSession.AppProcessesToClose -CloseProcessesCountdown 60
+    ## Same reasoning as Install-ADTDeployment above - no interactive welcome prompt
+    ## on an unattended, userless deployment.
 
 
     ##================================================
