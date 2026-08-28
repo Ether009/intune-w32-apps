@@ -1,0 +1,17 @@
+<Configuration>
+  <Add OfficeClientEdition="64" Channel="FirstReleaseCurrent">
+    <Product ID="O365ProPlusRetail">
+      <Language ID="sv-se" />
+      <ExcludeApp ID="OneNote" />
+      <ExcludeApp ID="Teams" />
+      <ExcludeApp ID="Bing" />
+      <ExcludeApp ID="SharePointDesigner" />
+      <ExcludeApp ID="Lync" />
+      <ExcludeApp ID="Groove" />
+      <ExcludeApp ID="InfoPath" />
+    </Product>
+  </Add>
+  <Property Name="SharedComputerLicensing" Value="1" />
+  <Display Level="None" AcceptEULA="TRUE" />
+  <RemoveMSI />
+</Configuration>
