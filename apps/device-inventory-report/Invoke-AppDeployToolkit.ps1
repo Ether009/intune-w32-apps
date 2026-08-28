@@ -98,7 +98,7 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Organization'
     AppName = 'Device Inventory Report'
-    AppVersion = '3.4.0'
+    AppVersion = '3.4.1'
     AppArch = ''
     AppLang = 'EN'
     AppRevision = '01'
