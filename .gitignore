@@ -13,6 +13,10 @@ apps/*/Invoke-AppDeployToolkit.exe
 *.intunewin
 *.orig
 
+# Scratch folder for manually assembling/testing a build locally (mirrors what CI
+# does in $RUNNER_TEMP) - never committed.
+.local-build/
+
 # device-inventory-report: CI injects the ingest mutual-TLS client cert into
 # SupportFiles at build time from repo secrets - it must never be committed. This
 # guards against it ever landing here from local testing.

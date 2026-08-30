@@ -15,6 +15,8 @@ env:
   PREP_TOOL_SHA256: 'C1BA45B5CB939E84AF064BB7FF4B38FB3DFE33C8DC1078FD9B157672EAE671F6'
   HP_CMSL_INSTALLER_URL: 'https://hpia.hpcloud.hp.com/downloads/cmsl/hp-cmsl-1.9.0.exe'
   HP_CMSL_INSTALLER_SHA256: '73CEC61DE075AD0F3471383C7590A245632FEC08372ED5FC30549F0E9B28FDC0'
+  FIREFOX_MSI_URL: 'https://ftp.mozilla.org/pub/firefox/releases/140.14.0esr/win64/en-US/Firefox%20Setup%20140.14.0esr.msi'
+  FIREFOX_MSI_SHA256: '381EEF556C4A2DC1FCAEDF31AFE886C51BC186274A26C7076C07E23246E3CF28'
 
 jobs:
   discover:
@@ -138,6 +140,31 @@ jobs:
           $hash = (Get-FileHash -Path $dest -Algorithm SHA256).Hash
           if ($hash -ne $env:HP_CMSL_INSTALLER_SHA256) { throw "HP CMSL installer hash mismatch: got $hash" }
           "[$env:APP_DIR] HP CMSL installer staged and hash-verified."
+
+      # firefox's SupportFiles are deliberately empty in source control - the Firefox
+      # ESR MSI is a ~70MB binary, well over GitHub's recommended file size, so it's
+      # downloaded here from Mozilla's official release archive and verified against
+      # a pinned SHA-256, same pattern as hp-cmsl above. Mozilla's release archive
+      # URLs are stable/permanent per version, unlike their "latest" bouncer link,
+      # which is why a specific version is pinned here rather than always fetching
+      # whatever is newest. Update FIREFOX_MSI_URL/_SHA256 to the new version (get
+      # the hash from the downloaded file directly, don't trust a copied value) and
+      # bump this app's AppVersion + $FirefoxProductCode in
+      # Invoke-AppDeployToolkit.ps1 (query the new MSI's own ProductCode property -
+      # it can change between ESR releases) to ship a newer Firefox ESR release.
+      - name: Inject Firefox ESR MSI
+        if: matrix.app == 'firefox'
+        shell: powershell
+        env:
+          APP_DIR: ${{ matrix.app }}
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $staging = Join-Path $env:RUNNER_TEMP "staging-$env:APP_DIR"
+          $dest = Join-Path $staging 'SupportFiles\FirefoxSetup.msi'
+          Invoke-WebRequest -Uri $env:FIREFOX_MSI_URL -OutFile $dest -UseBasicParsing
+          $hash = (Get-FileHash -Path $dest -Algorithm SHA256).Hash
+          if ($hash -ne $env:FIREFOX_MSI_SHA256) { throw "Firefox MSI hash mismatch: got $hash" }
+          "[$env:APP_DIR] Firefox ESR MSI staged and hash-verified."
 
       - name: Build .intunewin
         shell: powershell

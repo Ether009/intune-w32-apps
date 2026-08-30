@@ -1,0 +1,6 @@
+{
+  "displayName": "Mozilla Firefox (Win32)",
+  "intuneAppId": "38f5a869-64ea-4316-9dc3-cec210b45ccf",
+  "detectionRegistryPath": "HKLM:\\SOFTWARE\\Organization\\FirefoxWin32",
+  "detectionRegistryValueName": "Version"
+}
