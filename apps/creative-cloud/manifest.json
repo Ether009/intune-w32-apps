@@ -1,0 +1,6 @@
+{
+  "displayName": "Adobe Creative Cloud Desktop (Win32)",
+  "intuneAppId": "0e385de4-71d2-450f-a638-99b289a55539",
+  "detectionRegistryPath": "HKLM:\\SOFTWARE\\Organization\\CreativeCloudWin32",
+  "detectionRegistryValueName": "Version"
+}

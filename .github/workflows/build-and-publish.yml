@@ -17,6 +17,8 @@ env:
   HP_CMSL_INSTALLER_SHA256: '73CEC61DE075AD0F3471383C7590A245632FEC08372ED5FC30549F0E9B28FDC0'
   FIREFOX_MSI_URL: 'https://ftp.mozilla.org/pub/firefox/releases/140.14.0esr/win64/en-US/Firefox%20Setup%20140.14.0esr.msi'
   FIREFOX_MSI_SHA256: '381EEF556C4A2DC1FCAEDF31AFE886C51BC186274A26C7076C07E23246E3CF28'
+  CREATIVE_CLOUD_ZIP_URL: 'https://ccmdls.adobe.com/AdobeProducts/StandaloneBuilds/ACCC/ESD/6.10.0/252.3/win64/ACCCx6_10_0_252_3.zip'
+  CREATIVE_CLOUD_ZIP_SHA256: '6472F7F2C1E5F205F8EF5439E51FAD61008D9434DF4D0D32AFEDE51FF71FA655'
 
 jobs:
   discover:
@@ -165,6 +167,31 @@ jobs:
           $hash = (Get-FileHash -Path $dest -Algorithm SHA256).Hash
           if ($hash -ne $env:FIREFOX_MSI_SHA256) { throw "Firefox MSI hash mismatch: got $hash" }
           "[$env:APP_DIR] Firefox ESR MSI staged and hash-verified."
+
+      # creative-cloud's SupportFiles are deliberately empty in source control - the
+      # Adobe Creative Cloud Desktop ESD installer ships as a ZIP (Set-up.exe +
+      # packages/ + resources/, ~315MB unpacked), well over GitHub's recommended file
+      # size, so it's downloaded here from Adobe's official CDN and verified against a
+      # pinned SHA-256, same pattern as firefox/hp-cmsl above. Adobe's direct-download
+      # links are versioned but not guaranteed permanent - if this link 404s, find the
+      # current one from Adobe's official direct-links help page (not a search result
+      # or mirror), get its SHA-256 from the file you actually downloaded, and update
+      # CREATIVE_CLOUD_ZIP_URL/_SHA256 (and this app's AppVersion) to ship the new
+      # build.
+      - name: Inject Creative Cloud installer
+        if: matrix.app == 'creative-cloud'
+        shell: powershell
+        env:
+          APP_DIR: ${{ matrix.app }}
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $staging = Join-Path $env:RUNNER_TEMP "staging-$env:APP_DIR"
+          $zip = Join-Path $env:RUNNER_TEMP 'CreativeCloudSetup.zip'
+          Invoke-WebRequest -Uri $env:CREATIVE_CLOUD_ZIP_URL -OutFile $zip -UseBasicParsing
+          $hash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash
+          if ($hash -ne $env:CREATIVE_CLOUD_ZIP_SHA256) { throw "Creative Cloud installer hash mismatch: got $hash" }
+          Expand-Archive -Path $zip -DestinationPath (Join-Path $staging 'SupportFiles') -Force
+          "[$env:APP_DIR] Creative Cloud installer staged, hash-verified, and extracted."
 
       - name: Build .intunewin
         shell: powershell
