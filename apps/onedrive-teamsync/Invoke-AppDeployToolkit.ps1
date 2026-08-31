@@ -10,11 +10,14 @@ lost access to), replacing the old "OneDrive Sync Setup" remediation script.
 
 That old tool: (1) only ever added syncs, never removed stale ones after a Team rename/removal,
 (2) ran with a visible console window, (3) hardcoded a Graph app client secret in plaintext in
-the script body. This replaces all three: proper add/remove diffing, a hidden scheduled task
-instead of a visible startup shortcut, and certificate-based app auth (the cert is imported here
-into LocalMachine\My with its private key made readable by Authenticated Users, since the sync
-script runs in the interactive user's own session, not SYSTEM - it needs to read its own Team
-memberships and drive OneDrive's own already-running client instance).
+the script body, (4) used odopen:// to add syncs, which pops a visible OneDrive window per
+library - closing that window before it finishes cancels the add, and users at this org close
+anything they don't recognize on sight. This replaces all of it: proper add/remove diffing,
+a fully silent add path via OneDrive's own AutoMountTeamSites policy (no window at all), and
+certificate-based app auth. The sync script runs as SYSTEM (that policy's registry path is
+writable only by SYSTEM/Administrators, confirmed via a real ACL check - not even the user it
+acts on behalf of can write it) and resolves the actual interactive user itself to act on their
+behalf, rather than running in their own session.
 
 This installer also actively removes any leftover copy of the old tool (C:\Scripts\odsetup.ps1
 and its Startup-folder shortcut) from devices that picked it up before it was retired.
@@ -96,14 +99,14 @@ param
 $adtSession = @{
     AppVendor = 'Organization'
     AppName = 'OneDrive Team Sync'
-    AppVersion = '1.0.5'
+    AppVersion = '2.0.0'
     AppArch = 'x64'
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.0.5'
+    AppScriptVersion = '2.0.0'
     AppScriptDate = '2026-08-31'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -141,43 +144,17 @@ function Remove-LegacyOneDriveSyncSetup
     }
 }
 
-function Grant-TeamSyncCertificateKeyAccess
-{
-    param([Parameter(Mandatory)]$Cert)
-
-    # The sync script runs as the interactive user, not SYSTEM, so it needs read access to this
-    # cert's private key. LocalMachine private keys are SYSTEM/Administrators-only by default -
-    # grant read to Authenticated Users specifically (this cert can only sign token requests for
-    # Group.Read.All/User.Read.All - read-only Graph scopes - so a broad-but-read-only grant here
-    # is an acceptable, deliberate tradeoff, not an oversight).
-    $rsaKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Cert)
-    $keyContainerName = $rsaKey.Key.UniqueName
-    $keyPath = Join-Path $env:ProgramData "Microsoft\Crypto\RSA\MachineKeys\$keyContainerName"
-    if (Test-Path -LiteralPath $keyPath)
-    {
-        # Use the well-known SID (S-1-5-11) rather than the English name "Authenticated Users" -
-        # that literal string fails NTAccount translation on non-English Windows installs (this
-        # is Swedish-localized and calls the group "Autentiserade anvandare"). The SID resolves
-        # correctly regardless of system language.
-        $authenticatedUsersSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11')
-        $acl = Get-Acl -Path $keyPath
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($authenticatedUsersSid, 'Read', 'Allow')
-        $acl.AddAccessRule($rule)
-        Set-Acl -Path $keyPath -AclObject $acl
-    }
-    else
-    {
-        Write-ADTLogEntry -Message "Could not locate key container file at '$keyPath' to grant read access - Authenticated Users may not be able to use this cert." -Severity 2
-    }
-}
-
 function Install-TeamSyncCertificate
 {
     param([Parameter(Mandatory)][string]$PfxPath, [Parameter(Mandatory)][string]$PfxPassword)
 
+    # The sync script runs as SYSTEM (the AutoMountTeamSites registry path it needs to write is
+    # writable only by SYSTEM/Administrators, confirmed via a real ACL check - not even the user
+    # it acts on behalf of can write it), so LocalMachine\My's default SYSTEM/Administrators-only
+    # access is exactly right here - no ACL broadening needed, unlike an earlier version of this
+    # script that ran as the interactive user and had to grant Authenticated Users read access.
     $securePw = ConvertTo-SecureString -String $PfxPassword -Force -AsPlainText
     $cert = Import-PfxCertificate -FilePath $PfxPath -CertStoreLocation 'Cert:\LocalMachine\My' -Password $securePw -Exportable:$false
-    Grant-TeamSyncCertificateKeyAccess -Cert $cert
     return $cert.Thumbprint
 }
 
@@ -202,10 +179,15 @@ function Register-LogonTask
     # Built and registered via schtasks.exe /create /xml rather than the ScheduledTasks module -
     # Register-ScheduledTask with a GroupId principal silently failed to persist the task on a
     # non-English (Swedish) system with no error surfaced at all (install completed, exit 0, no
-    # task). The XML form references the group by its well-known SID directly
-    # (S-1-5-32-545 = BUILTIN\Users), sidestepping name translation entirely, and schtasks.exe's
-    # own registration path has proven more reliable for this specific "any user, at their own
-    # logon" scenario than the newer PowerShell cmdlets.
+    # task). The XML form's own registration path has proven more reliable than the newer
+    # PowerShell cmdlets for this scenario generally, independent of that specific bug.
+    #
+    # Runs as SYSTEM (S-1-5-18), not as the logged-on user: the AutoMountTeamSites registry path
+    # the sync script writes to is writable only by SYSTEM/Administrators, confirmed via a real
+    # ACL check - not even the user it acts on behalf of can write it. The script itself resolves
+    # the actual interactive user (via explorer.exe's owning SID) and operates on their
+    # HKEY_USERS hive explicitly rather than relying on HKCU, which under SYSTEM would just be
+    # SYSTEM's own (irrelevant) profile.
     $xml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -216,8 +198,8 @@ function Register-LogonTask
   </Triggers>
   <Principals>
     <Principal id="Author">
-      <GroupId>S-1-5-32-545</GroupId>
-      <RunLevel>LeastPrivilege</RunLevel>
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
     </Principal>
   </Principals>
   <Settings>
@@ -292,9 +274,7 @@ function Install-ADTDeployment
     $pfxPassword = Get-Content -LiteralPath $pfxPasswordPath -Raw
 
     # Skip re-importing if this exact cert is already present (Import-PfxCertificate isn't
-    # idempotent-cheap, and repeat installs during testing shouldn't keep duplicating it) - but
-    # always (re)grant the key ACL regardless, since a prior install attempt could have imported
-    # the cert and then failed before reaching that step.
+    # idempotent-cheap, and repeat installs during testing shouldn't keep duplicating it).
     $existing = Get-ChildItem 'Cert:\LocalMachine\My' | Where-Object { $_.Subject -eq $CertSubject }
     if (-not $existing)
     {
@@ -303,8 +283,7 @@ function Install-ADTDeployment
     }
     else
     {
-        Write-ADTLogEntry -Message "Certificate already present: $($existing[0].Thumbprint) - re-checking key access."
-        Grant-TeamSyncCertificateKeyAccess -Cert $existing[0]
+        Write-ADTLogEntry -Message "Certificate already present: $($existing[0].Thumbprint)"
     }
 
     # The PFX and its password only ever exist transiently on disk during this install step -
