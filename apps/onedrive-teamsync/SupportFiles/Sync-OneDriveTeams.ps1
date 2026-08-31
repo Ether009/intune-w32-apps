@@ -150,6 +150,12 @@ function Add-SyncedLibrary {
            "&webtitle=$([System.Web.HttpUtility]::UrlEncode($DisplayName).Replace('+','%20'))"
     Write-Log "Adding sync: $DisplayName ($WebUrl)"
     Start-Process $url
+    # The old tool this replaces paced its own odopen:// calls 3 seconds apart for exactly this
+    # reason ("not having a delay can cause OneDrive to barf when adding multiple sync folders
+    # at once") - confirmed for real on LF52389, where an unthrottled first-run sync across 11
+    # Teams caused OneDrive to visibly stall partway through. 3 seconds wasn't enough margin, so
+    # this uses a longer 15-second pace instead.
+    Start-Sleep -Seconds 15
 }
 #endregion
 

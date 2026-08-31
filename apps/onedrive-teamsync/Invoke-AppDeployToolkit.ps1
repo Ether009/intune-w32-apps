@@ -96,14 +96,14 @@ param
 $adtSession = @{
     AppVendor = 'Organization'
     AppName = 'OneDrive Team Sync'
-    AppVersion = '1.0.4'
+    AppVersion = '1.0.5'
     AppArch = 'x64'
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.0.4'
+    AppScriptVersion = '1.0.5'
     AppScriptDate = '2026-08-31'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -225,7 +225,7 @@ function Register-LogonTask
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <Hidden>true</Hidden>
-    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>
+    <ExecutionTimeLimit>PT45M</ExecutionTimeLimit>
   </Settings>
   <Actions Context="Author">
     <Exec>
