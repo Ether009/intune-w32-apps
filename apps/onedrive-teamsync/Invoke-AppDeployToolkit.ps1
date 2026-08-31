@@ -96,14 +96,14 @@ param
 $adtSession = @{
     AppVendor = 'Organization'
     AppName = 'OneDrive Team Sync'
-    AppVersion = '1.0.1'
+    AppVersion = '1.0.2'
     AppArch = 'x64'
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.0.1'
+    AppScriptVersion = '1.0.2'
     AppScriptDate = '2026-08-31'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -199,14 +199,53 @@ function Register-ToastProtocolHandler
 
 function Register-LogonTask
 {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    # Built and registered via schtasks.exe /create /xml rather than the ScheduledTasks module -
+    # Register-ScheduledTask with a GroupId principal silently failed to persist the task on a
+    # non-English (Swedish) system with no error surfaced at all (install completed, exit 0, no
+    # task). The XML form references the group by its well-known SID directly
+    # (S-1-5-32-545 = BUILTIN\Users), sidestepping name translation entirely, and schtasks.exe's
+    # own registration path has proven more reliable for this specific "any user, at their own
+    # logon" scenario than the newer PowerShell cmdlets.
+    $xml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <GroupId>S-1-5-32-545</GroupId>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <Hidden>true</Hidden>
+    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>-WindowStyle Hidden -ExecutionPolicy Bypass -NonInteractive -File "$ScriptDest"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+    $xmlPath = Join-Path $env:TEMP 'OneDriveTeamSync-task.xml'
+    # schtasks.exe requires the XML file itself to be UTF-16 - plain Out-File defaults to UTF-8.
+    [System.IO.File]::WriteAllText($xmlPath, $xml, [System.Text.Encoding]::Unicode)
 
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -NonInteractive -File `"$ScriptDest`""
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
-    $principal = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\Users' -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
-
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
+    schtasks.exe /Delete /TN $TaskName /F 2>&1 | Out-Null
+    $result = schtasks.exe /Create /TN $TaskName /XML $xmlPath /F 2>&1
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "schtasks.exe failed to register the '$TaskName' task: $result"
+    }
+    Remove-Item -LiteralPath $xmlPath -Force -ErrorAction SilentlyContinue
 }
 
 
@@ -293,7 +332,7 @@ function Uninstall-ADTDeployment
     ##================================================
     $adtSession.InstallPhase = $adtSession.DeploymentType
 
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    schtasks.exe /Delete /TN $TaskName /F 2>&1 | Out-Null
     Remove-Item -Path 'HKLM:\SOFTWARE\Classes\odteamsync' -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
     Get-ChildItem 'Cert:\LocalMachine\My' | Where-Object { $_.Subject -eq $CertSubject } | Remove-Item -Force -ErrorAction SilentlyContinue
