@@ -96,14 +96,14 @@ param
 $adtSession = @{
     AppVendor = 'Organization'
     AppName = 'OneDrive Team Sync'
-    AppVersion = '1.0.2'
+    AppVersion = '1.0.3'
     AppArch = 'x64'
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.0.2'
+    AppScriptVersion = '1.0.3'
     AppScriptDate = '2026-08-31'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -239,11 +239,26 @@ function Register-LogonTask
     # schtasks.exe requires the XML file itself to be UTF-16 - plain Out-File defaults to UTF-8.
     [System.IO.File]::WriteAllText($xmlPath, $xml, [System.Text.Encoding]::Unicode)
 
-    schtasks.exe /Delete /TN $TaskName /F 2>&1 | Out-Null
-    $result = schtasks.exe /Create /TN $TaskName /XML $xmlPath /F 2>&1
-    if ($LASTEXITCODE -ne 0)
+    # schtasks.exe writes its "task not found" message to stderr on a delete-before-create -
+    # completely expected/harmless on first install, but under $ErrorActionPreference = 'Stop'
+    # (set globally below), merging that stderr line into the pipeline via 2>&1 gets promoted
+    # to a terminating NativeCommandError and aborted the whole install (confirmed via a real
+    # failed install on LF52389). Run both calls under a locally-relaxed preference instead,
+    # and rely on $LASTEXITCODE for the actual success/failure check.
+    $previousEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try
     {
-        throw "schtasks.exe failed to register the '$TaskName' task: $result"
+        schtasks.exe /Delete /TN $TaskName /F 2>$null | Out-Null
+        $result = schtasks.exe /Create /TN $TaskName /XML $xmlPath /F 2>&1
+        if ($LASTEXITCODE -ne 0)
+        {
+            throw "schtasks.exe failed to register the '$TaskName' task: $result"
+        }
+    }
+    finally
+    {
+        $ErrorActionPreference = $previousEap
     }
     Remove-Item -LiteralPath $xmlPath -Force -ErrorAction SilentlyContinue
 }
@@ -332,7 +347,7 @@ function Uninstall-ADTDeployment
     ##================================================
     $adtSession.InstallPhase = $adtSession.DeploymentType
 
-    schtasks.exe /Delete /TN $TaskName /F 2>&1 | Out-Null
+    schtasks.exe /Delete /TN $TaskName /F 2>$null | Out-Null
     Remove-Item -Path 'HKLM:\SOFTWARE\Classes\odteamsync' -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
     Get-ChildItem 'Cert:\LocalMachine\My' | Where-Object { $_.Subject -eq $CertSubject } | Remove-Item -Force -ErrorAction SilentlyContinue
