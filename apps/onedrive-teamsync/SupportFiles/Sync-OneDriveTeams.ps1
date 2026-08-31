@@ -46,7 +46,11 @@ function Get-GraphToken {
     $payloadB64 = & $toBase64Url ([Text.Encoding]::UTF8.GetBytes($payload))
     $unsigned = "$headerB64.$payloadB64"
 
-    $rsa = $cert.PrivateKey
+    # $cert.PrivateKey (the legacy CAPI-compatible property) doesn't reliably support the modern
+    # SignData(bytes, HashAlgorithmName, RSASignaturePadding) overload against a CNG-backed
+    # imported certificate - confirmed via a real run ("The specified algorithm is invalid").
+    # GetRSAPrivateKey() returns the correct modern RSACng wrapper instead.
+    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
     $signature = $rsa.SignData([Text.Encoding]::UTF8.GetBytes($unsigned), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
     $sigB64 = & $toBase64Url $signature
     $clientAssertion = "$unsigned.$sigB64"
