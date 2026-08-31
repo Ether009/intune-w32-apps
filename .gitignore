@@ -23,5 +23,10 @@ apps/*/Invoke-AppDeployToolkit.exe
 apps/device-inventory-report/SupportFiles/client-cert.pfx
 apps/device-inventory-report/SupportFiles/client-cert.pfx.pw
 
+# onedrive-teamsync: CI injects the OneDrive-TeamSync-App Graph auth certificate into
+# SupportFiles at build time from repo secrets - same reasoning as device-inventory-report.
+apps/onedrive-teamsync/SupportFiles/onedrive-teamsync-cert.pfx
+apps/onedrive-teamsync/SupportFiles/onedrive-teamsync-cert.pfx.pw
+
 # Local-only credential notes - never committed
 secret.md

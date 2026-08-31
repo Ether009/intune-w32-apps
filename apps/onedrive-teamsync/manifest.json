@@ -1,0 +1,6 @@
+{
+  "displayName": "OneDrive Team Sync",
+  "intuneAppId": "451986e2-ea47-4a67-b1e5-3c1a2b848486",
+  "detectionRegistryPath": "HKLM:\\SOFTWARE\\Organization\\OneDriveTeamSync",
+  "detectionRegistryValueName": "Version"
+}
