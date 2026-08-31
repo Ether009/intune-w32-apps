@@ -96,14 +96,14 @@ param
 $adtSession = @{
     AppVendor = 'Organization'
     AppName = 'OneDrive Team Sync'
-    AppVersion = '1.0.0'
+    AppVersion = '1.0.1'
     AppArch = 'x64'
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.0.0'
+    AppScriptVersion = '1.0.1'
     AppScriptDate = '2026-08-31'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -141,25 +141,27 @@ function Remove-LegacyOneDriveSyncSetup
     }
 }
 
-function Install-TeamSyncCertificate
+function Grant-TeamSyncCertificateKeyAccess
 {
-    param([Parameter(Mandatory)][string]$PfxPath, [Parameter(Mandatory)][string]$PfxPassword)
-
-    $securePw = ConvertTo-SecureString -String $PfxPassword -Force -AsPlainText
-    $cert = Import-PfxCertificate -FilePath $PfxPath -CertStoreLocation 'Cert:\LocalMachine\My' -Password $securePw -Exportable:$false
+    param([Parameter(Mandatory)]$Cert)
 
     # The sync script runs as the interactive user, not SYSTEM, so it needs read access to this
     # cert's private key. LocalMachine private keys are SYSTEM/Administrators-only by default -
     # grant read to Authenticated Users specifically (this cert can only sign token requests for
     # Group.Read.All/User.Read.All - read-only Graph scopes - so a broad-but-read-only grant here
     # is an acceptable, deliberate tradeoff, not an oversight).
-    $rsaKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+    $rsaKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Cert)
     $keyContainerName = $rsaKey.Key.UniqueName
     $keyPath = Join-Path $env:ProgramData "Microsoft\Crypto\RSA\MachineKeys\$keyContainerName"
     if (Test-Path -LiteralPath $keyPath)
     {
+        # Use the well-known SID (S-1-5-11) rather than the English name "Authenticated Users" -
+        # that literal string fails NTAccount translation on non-English Windows installs (this
+        # is Swedish-localized and calls the group "Autentiserade anvandare"). The SID resolves
+        # correctly regardless of system language.
+        $authenticatedUsersSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11')
         $acl = Get-Acl -Path $keyPath
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule('Authenticated Users', 'Read', 'Allow')
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($authenticatedUsersSid, 'Read', 'Allow')
         $acl.AddAccessRule($rule)
         Set-Acl -Path $keyPath -AclObject $acl
     }
@@ -167,7 +169,15 @@ function Install-TeamSyncCertificate
     {
         Write-ADTLogEntry -Message "Could not locate key container file at '$keyPath' to grant read access - Authenticated Users may not be able to use this cert." -Severity 2
     }
+}
 
+function Install-TeamSyncCertificate
+{
+    param([Parameter(Mandatory)][string]$PfxPath, [Parameter(Mandatory)][string]$PfxPassword)
+
+    $securePw = ConvertTo-SecureString -String $PfxPassword -Force -AsPlainText
+    $cert = Import-PfxCertificate -FilePath $PfxPath -CertStoreLocation 'Cert:\LocalMachine\My' -Password $securePw -Exportable:$false
+    Grant-TeamSyncCertificateKeyAccess -Cert $cert
     return $cert.Thumbprint
 }
 
@@ -228,7 +238,9 @@ function Install-ADTDeployment
     $pfxPassword = Get-Content -LiteralPath $pfxPasswordPath -Raw
 
     # Skip re-importing if this exact cert is already present (Import-PfxCertificate isn't
-    # idempotent-cheap, and repeat installs during testing shouldn't keep duplicating it).
+    # idempotent-cheap, and repeat installs during testing shouldn't keep duplicating it) - but
+    # always (re)grant the key ACL regardless, since a prior install attempt could have imported
+    # the cert and then failed before reaching that step.
     $existing = Get-ChildItem 'Cert:\LocalMachine\My' | Where-Object { $_.Subject -eq $CertSubject }
     if (-not $existing)
     {
@@ -237,7 +249,8 @@ function Install-ADTDeployment
     }
     else
     {
-        Write-ADTLogEntry -Message "Certificate already present: $($existing[0].Thumbprint)"
+        Write-ADTLogEntry -Message "Certificate already present: $($existing[0].Thumbprint) - re-checking key access."
+        Grant-TeamSyncCertificateKeyAccess -Cert $existing[0]
     }
 
     # The PFX and its password only ever exist transiently on disk during this install step -
