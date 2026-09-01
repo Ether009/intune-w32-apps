@@ -260,11 +260,24 @@ function Disconnect-SyncedLibrary {
     Remove-Item -Path $Library.RegistryKey -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+function Get-OneDriveExePath {
+    # OneDrive can be installed per-machine (Program Files) or per-user (LocalAppData) depending
+    # on how it was deployed - confirmed for real that this fleet uses the per-machine install,
+    # not the per-user one this originally assumed. Check both rather than hardcode either.
+    $candidates = @(
+        'C:\Program Files\Microsoft OneDrive\OneDrive.exe',
+        (Join-Path $UserContext.LocalAppData 'Microsoft\OneDrive\OneDrive.exe')
+    )
+    $found = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $found) { throw "Could not locate OneDrive.exe in any known install location." }
+    return $found
+}
+
 function Wait-ForOneDriveToSettle {
     Write-Log "Restarting OneDrive (in-session) and waiting for it to settle before touching local folders."
     Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $UserContext.SessionId } | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 5
-    $exePath = Join-Path $UserContext.LocalAppData 'Microsoft\OneDrive\OneDrive.exe'
+    $exePath = Get-OneDriveExePath
     Start-ProcessInUserSession -SessionId $UserContext.SessionId -CommandLine "`"$exePath`" /background"
     # A restarted OneDrive process existing isn't the same as it having actually finished
     # reloading the sync engine and releasing file handles on the folders we just disconnected -
