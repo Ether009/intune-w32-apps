@@ -35,6 +35,48 @@ public static class RunAsUser
     static extern bool DuplicateTokenEx(IntPtr hExistingToken, uint dwDesiredAccess, IntPtr lpTokenAttributes,
         int impersonationLevel, int tokenType, out IntPtr phNewToken);
 
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges,
+        ref TOKEN_PRIVILEGES NewState, uint BufferLengthInBytes, IntPtr PreviousState, IntPtr ReturnLengthInBytes);
+
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct LUID { public uint LowPart; public int HighPart; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID Luid; public uint Attributes; }
+
+    // WTSQueryUserToken requires SeTcbPrivilege to be actively enabled on the calling token, not
+    // merely present - confirmed for real that a SYSTEM token launched via a raw PsExec -s child
+    // has it present but disabled, which makes WTSQueryUserToken fail silently (a real Scheduled
+    // Task launch of this same script may or may not already have it enabled depending on how
+    // it's invoked, so enabling it explicitly here removes the ambiguity rather than relying on
+    // the launch method to have gotten it right).
+    public static void EnableTcbPrivilege()
+    {
+        IntPtr hToken;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x0020 /* TOKEN_ADJUST_PRIVILEGES */ | 0x0008 /* TOKEN_QUERY */, out hToken))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "OpenProcessToken failed");
+        try
+        {
+            LUID luid;
+            if (!LookupPrivilegeValue(null, "SeTcbPrivilege", out luid))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "LookupPrivilegeValue(SeTcbPrivilege) failed");
+            var tp = new TOKEN_PRIVILEGES { PrivilegeCount = 1, Luid = luid, Attributes = 0x00000002 /* SE_PRIVILEGE_ENABLED */ };
+            if (!AdjustTokenPrivileges(hToken, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "AdjustTokenPrivileges(SeTcbPrivilege) failed");
+        }
+        finally { CloseHandle(hToken); }
+    }
+
     [DllImport("userenv.dll", SetLastError = true)]
     static extern bool CreateEnvironmentBlock(out IntPtr lpEnvironment, IntPtr hToken, bool bInherit);
 
@@ -66,17 +108,23 @@ public static class RunAsUser
         IntPtr lpEnvironment, string lpCurrentDirectory, ref STARTUPINFO lpStartupInfo,
         out PROCESS_INFORMATION lpProcessInformation);
 
-    public static bool Start(uint sessionId, string commandLine)
+    public static void Start(uint sessionId, string commandLine)
     {
+        // Every failure below throws with GetLastError rather than returning bool - a prior
+        // version swallowed all of this via "| Out-Null" on the PowerShell side, which let a
+        // silently-failed OneDrive /shutdown look identical to a successful one until the code
+        // that waited for the process to actually exit timed out with no clue why.
         IntPtr userToken;
-        if (!WTSQueryUserToken(sessionId, out userToken)) return false;
+        if (!WTSQueryUserToken(sessionId, out userToken))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "WTSQueryUserToken failed for session " + sessionId);
 
         IntPtr dupToken;
         // SecurityImpersonation = 2, TokenPrimary = 1, TOKEN_ALL_ACCESS-ish via 0xF01FF
         if (!DuplicateTokenEx(userToken, 0xF01FF, IntPtr.Zero, 2, 1, out dupToken))
         {
+            int err = Marshal.GetLastWin32Error();
             CloseHandle(userToken);
-            return false;
+            throw new System.ComponentModel.Win32Exception(err, "DuplicateTokenEx failed");
         }
 
         IntPtr env;
@@ -90,12 +138,13 @@ public static class RunAsUser
         // CREATE_UNICODE_ENVIRONMENT (0x400) | CREATE_NO_WINDOW (0x08000000)
         bool ok = CreateProcessAsUser(dupToken, null, commandLine, IntPtr.Zero, IntPtr.Zero, false,
             0x08000400, env, null, ref si, out pi);
+        int createErr = ok ? 0 : Marshal.GetLastWin32Error();
 
         if (env != IntPtr.Zero) DestroyEnvironmentBlock(env);
         CloseHandle(dupToken);
         CloseHandle(userToken);
         if (ok) { CloseHandle(pi.hProcess); CloseHandle(pi.hThread); }
-        return ok;
+        if (!ok) throw new System.ComponentModel.Win32Exception(createErr, "CreateProcessAsUser failed for: " + commandLine);
     }
 }
 '@
@@ -121,10 +170,11 @@ function Get-InteractiveUserContext {
 
 function Start-ProcessInUserSession {
     param([Parameter(Mandatory)][uint32]$SessionId, [Parameter(Mandatory)][string]$CommandLine)
-    [RunAsUser]::Start($SessionId, $CommandLine) | Out-Null
+    [RunAsUser]::Start($SessionId, $CommandLine)
 }
 #endregion
 
+[RunAsUser]::EnableTcbPrivilege()
 $UserContext = Get-InteractiveUserContext
 $LogDir = Join-Path $UserContext.LocalAppData 'OneDriveTeamSync'
 $LogFile = Join-Path $LogDir 'sync.log'
@@ -232,32 +282,44 @@ function Get-SyncedLibraries {
     if (-not (Test-Path $root)) { return @() }
     Get-ChildItem $root | ForEach-Object {
         $props = Get-ItemProperty $_.PSPath
-        if ($props.UrlNamespace -match ';\{([0-9a-fA-F-]+)\};\{([0-9a-fA-F-]+)\};\{([0-9a-fA-F-]+)\}') {
-            [pscustomobject]@{
-                RegistryKey = $_.PSPath
-                MountPoint  = $props.MountPoint
-                UrlNamespace = $props.UrlNamespace
-                SiteId      = $Matches[1]
-                WebId       = $Matches[2]
-                ListId      = $Matches[3]
-            }
+        # UrlNamespace is a plain URL with no embedded ids in real data ("https://tenant.sharepoint.com
+        # /sites/xxx/Delade dokument/") - SiteId/WebId/ListId below are left null and resolved
+        # separately (see Get-LibrarySiteIdentifiers) only for the libraries actually being
+        # disconnected, rather than guessed here from a pattern that doesn't match reality.
+        [pscustomobject]@{
+            RegistryKey  = $_.PSPath
+            SyncId       = $_.PSChildName
+            MountPoint   = $props.MountPoint
+            UrlNamespace = $props.UrlNamespace
+            SiteId       = $null
+            WebId        = $null
+            ListId       = $null
         }
     }
 }
 
-function Disconnect-SyncedLibrary {
-    # Registry-only: tells OneDrive's sync engine to stop tracking this library. Deliberately
-    # does NOT touch the local folder - deleting local files before OneDrive has actually
-    # released the folder risks OneDrive's file-system watcher seeing files "disappear" from a
-    # path it still believes is live, and syncing that deletion up to SharePoint itself. This
-    # happened for real during testing: a folder was deleted immediately after the registry key,
-    # with no restart/settle time in between, and the files were deleted online too (recovered
-    # from the SharePoint recycle bin, but it was a real production incident). Local folder
-    # deletion now only happens in the main pass, after OneDrive has been restarted and given
-    # real time to settle - see Wait-ForOneDriveToSettle / Remove-StaleLocalFolders below.
-    param($Library)
-    Write-Log "Disconnecting sync: $($Library.UrlNamespace)"
-    Remove-Item -Path $Library.RegistryKey -Recurse -Force -ErrorAction SilentlyContinue
+function Get-SitePathFromUrl {
+    param($Url)
+    if ($Url -match '^https://[^/]+/sites/([^/]+)/?') { return $Matches[1] }
+    return $null
+}
+
+function Get-LibrarySiteIdentifiers {
+    # A library being disconnected needs its real SiteId/WebId/ListId to build the ClientPolicy
+    # ini filename (see Remove-OneDriveDeepSyncState) - UrlNamespace alone doesn't carry them.
+    # Prefer the TenantAutoMount entry this tool itself wrote when it added the library (no extra
+    # Graph call, and the ListId embedded there beats re-deriving one via template-matching);
+    # fall back to a live Graph lookup by site path for anything that arrived without one (a
+    # manually-added library, or a prior partial run that already cleared its entry).
+    param($Token, $Library, $AutoMounted)
+    if ($Library.UrlNamespace -match '^https://([^/]+)/sites/([^/]+)/') {
+        $sitePath = $Matches[2]
+        $match = $AutoMounted | Where-Object { $_.Data -match [regex]::Escape("/sites/$sitePath") } | Select-Object -First 1
+        if ($match -and $match.Data -match 'webId=\{?([0-9a-fA-F-]+)\}?.*listId=([0-9a-fA-F-]+).*webUrl=([^&]+)') {
+            return [pscustomobject]@{ SiteId = $match.SiteId; WebId = $Matches[1]; ListId = $Matches[2]; WebUrl = $Matches[3] }
+        }
+    }
+    return Resolve-SiteInfoFromUrl -Token $Token -UrlNamespace $Library.UrlNamespace
 }
 
 function Get-OneDriveExePath {
@@ -273,24 +335,102 @@ function Get-OneDriveExePath {
     return $found
 }
 
-function Wait-ForOneDriveToSettle {
-    Write-Log "Restarting OneDrive (in-session) and waiting for it to settle before touching local folders."
-    Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $UserContext.SessionId } | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 5
-    $exePath = Get-OneDriveExePath
-    Start-ProcessInUserSession -SessionId $UserContext.SessionId -CommandLine "`"$exePath`" /background"
-    # A restarted OneDrive process existing isn't the same as it having actually finished
-    # reloading the sync engine and releasing file handles on the folders we just disconnected -
-    # there's no reliable API to ask "are you done." Give it a generous, fixed settle window
-    # rather than racing it, given what a wrong guess here already cost once.
-    Start-Sleep -Seconds 60
+function Stop-OneDriveProcess {
+    param([int]$TimeoutSeconds = 30)
+    Write-Log "Stopping OneDrive."
+    Start-ProcessInUserSession -SessionId $UserContext.SessionId -CommandLine "`"$(Get-OneDriveExePath)`" /shutdown"
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $UserContext.SessionId }) -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 300
+    }
+    if (Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $UserContext.SessionId }) {
+        throw "OneDrive did not stop within $TimeoutSeconds seconds."
+    }
+}
+
+function Start-OneDriveProcess {
+    Write-Log "Restarting OneDrive."
+    Start-ProcessInUserSession -SessionId $UserContext.SessionId -CommandLine "`"$(Get-OneDriveExePath)`" /background"
+}
+
+# Cloud Filter API (cldapi.dll) - the public Win32 API any cloud-sync provider (OneDrive included)
+# registers/unregisters a synced folder ("sync root") through at the OS level. Confirmed for real,
+# against a live tenant, that this - not any of the registry surfaces below - is the actual
+# authoritative switch: CfGetSyncRootInfoByPath succeeding means Windows still considers the path
+# a live cloud sync root regardless of what OneDrive's own registry mirrors say.
+if (-not ("CloudFilter.Api" -as [type])) {
+    Add-Type -Namespace CloudFilter -Name Api -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("cldapi.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern int CfUnregisterSyncRoot(string syncRootPath);
+[System.Runtime.InteropServices.DllImport("cldapi.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern int CfGetSyncRootInfoByPath(string filePath, int infoClass, System.IntPtr syncRootInfo, uint syncRootInfoLength, out uint returnedLength);
+"@
+}
+
+# HRESULT for the underlying Win32 error "not a cloud file" (ERROR_NOT_A_CLOUD_FILE) - what
+# CfGetSyncRootInfoByPath returns for a path that is confirmed NOT registered as a sync root.
+$script:CF_NOT_A_CLOUD_FILE_HRESULT = 0x80070186
+
+function Test-SyncRootRegistered {
+    # $true = still a live sync root. $false = confirmed unregistered. Throws on anything else,
+    # since an unrecognized error here means we don't actually know the state - and per the
+    # incidents that got us here, an unknown state must never be treated as "safe to delete."
+    param($Path)
+    $buf = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(8200)
+    try {
+        [uint32]$outLen = 0
+        $hr = [CloudFilter.Api]::CfGetSyncRootInfoByPath($Path, 0, $buf, 8200, [ref]$outLen)
+        if ($hr -eq 0) { return $true }
+        if ($hr -eq $script:CF_NOT_A_CLOUD_FILE_HRESULT) { return $false }
+        throw "CfGetSyncRootInfoByPath returned unexpected HRESULT 0x{0:X8} for $Path" -f $hr
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::FreeHGlobal($buf)
+    }
+}
+
+function Invoke-UnregisterSyncRoot {
+    param($Path)
+    $hr = [CloudFilter.Api]::CfUnregisterSyncRoot($Path)
+    if ($hr -ne 0) { throw "CfUnregisterSyncRoot failed for $Path with HRESULT 0x{0:X8}" -f $hr }
+}
+
+function Remove-OneDriveDeepSyncState {
+    # OneDrive rebuilds SyncEngines\Providers\OneDrive and its Cloud Filter sync-root registration
+    # FROM this state on every start - confirmed for real that removing only those two downstream
+    # copies (plus even the TenantAutoMount policy entry) is not durable: OneDrive fully
+    # re-registered a stale sync from this ini state alone on its next restart. This must run
+    # while OneDrive is stopped (it owns these files while running).
+    param($SyncId, $SiteId, $ListId)
+    $settingsDir = "$($UserContext.LocalAppData)\Microsoft\OneDrive\settings\$($script:OneDriveAccountName)"
+    $siteIdRaw = $SiteId -replace '[{}-]', ''
+    $listIdRaw = $ListId -replace '[{}-]', ''
+
+    $clientPolicyFile = Join-Path $settingsDir "ClientPolicy_${listIdRaw}_${siteIdRaw}.ini"
+    if (Test-Path -LiteralPath $clientPolicyFile) {
+        Remove-Item -LiteralPath $clientPolicyFile -Force
+    }
+
+    Remove-ItemProperty -LiteralPath "$($UserContext.HkuRoot)\Software\Microsoft\OneDrive\Accounts\$($script:OneDriveAccountName)\ScopeIdToMountPointPathCache" -Name $SyncId -ErrorAction SilentlyContinue
+
+    # The account-scoped ini is named after the account's own GUID (OneAuthAccountId), not the
+    # "Business1"-style key name - resolved once and stashed alongside the other account details.
+    $accountIniFile = Join-Path $settingsDir "$($script:OneDriveOneAuthAccountId).ini"
+    if (Test-Path -LiteralPath $accountIniFile) {
+        $syncIdEscaped = [regex]::Escape($SyncId)
+        $tmp = "$accountIniFile.tmp"
+        Get-Content -LiteralPath $accountIniFile -Encoding Unicode | Where-Object { $_ -notmatch $syncIdEscaped } | Set-Content -LiteralPath $tmp -Encoding Unicode
+        Remove-Item -LiteralPath $accountIniFile -Force
+        Rename-Item -LiteralPath $tmp -NewName (Split-Path $accountIniFile -Leaf)
+    }
+
+    Remove-Item -Path "$($UserContext.HkuRoot)\Software\SyncEngines\Providers\OneDrive\$SyncId" -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 function Remove-StaleLocalFolders {
     param($Libraries)
     foreach ($lib in $Libraries) {
         if ($lib.MountPoint -and (Test-Path $lib.MountPoint)) {
-            Write-Log "Deleting local folder (post-settle): $($lib.MountPoint)"
+            Write-Log "Deleting local folder (verified unsynced): $($lib.MountPoint)"
             Remove-Item -Path $lib.MountPoint -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
@@ -307,7 +447,8 @@ function Remove-StaleLocalFolders {
 # OneDrive itself picks these up on its own (next OneDrive.exe start / within its own window) -
 # no window, no user interaction, unlike odopen://. Confirmed via Microsoft's own documentation
 # that REMOVING an entry does NOT automatically unsync an already-synced library - this only
-# replaces the add path; removal still goes through Disconnect-SyncedLibrary above.
+# replaces the add path; removal still goes through Remove-OneDriveDeepSyncState/Invoke-
+# UnregisterSyncRoot in the main pass's Disconnect region.
 #
 # Confirmed via a real ACL check that this key is writable only by SYSTEM/Administrators, even
 # for the user it's acting on behalf of - this is why this whole script runs as SYSTEM and
@@ -357,10 +498,30 @@ function Get-CurrentUserUpn {
     foreach ($account in Get-ChildItem $accountsPath) {
         $props = Get-ItemProperty $account.PSPath -ErrorAction SilentlyContinue
         if ($props.ConfiguredTenantId -eq $TenantId -and $props.UserEmail) {
+            # Stashed for Reset-AutoMountTimer/Remove-OneDriveDeepSyncState below - avoids
+            # re-deriving which Accounts\Business* key belongs to this tenant a second time.
+            $script:OneDriveAccountPath = $account.PSPath
+            $script:OneDriveAccountName = $account.PSChildName
+            $script:OneDriveOneAuthAccountId = $props.OneAuthAccountId
             return $props.UserEmail
         }
     }
     throw "No OneDrive account configured for tenant $TenantId under the user's hive."
+}
+
+function Reset-AutoMountTimer {
+    # OneDrive throttles its own AutoMountTeamSites processing to roughly every 8 hours via an
+    # internal cooldown timestamp (undocumented, found via https://call4cloud.nl/timer-automount-of-onedrive-team-sites/
+    # and confirmed for real on this tenant: a freshly-added, verified-correct TenantAutoMount
+    # entry sat unprocessed through a full OneDrive restart AND a full device reboot+relogin,
+    # because this timer - not process/session state - is what actually gates the check).
+    # TimerAutoMount holds the epoch-seconds timestamp of the last check; OneDrive only re-checks
+    # once ~8h have passed since. Resetting it to 1 makes the next check look overdue, so the
+    # OneDrive restart that follows picks up new entries immediately instead of silently waiting
+    # out the rest of that window.
+    if (-not $script:OneDriveAccountPath) { return }
+    Write-Log "Resetting OneDrive AutoMountTeamSites cooldown timer to force immediate pickup."
+    Set-ItemProperty -LiteralPath $script:OneDriveAccountPath -Name TimerAutoMount -Value 1 -Type QWord -ErrorAction SilentlyContinue
 }
 
 function Get-CurrentUserTeams {
@@ -387,6 +548,24 @@ function Get-TeamSiteInfo {
         ListId   = $docLib.id
         WebUrl   = $site.webUrl
     }
+}
+
+function Resolve-SiteInfoFromUrl {
+    # Fallback for a stale library being disconnected whose site's Team the user is no longer a
+    # member of (so Get-TeamSiteInfo's group-scoped lookup isn't usable) and that has no matching
+    # TenantAutoMount entry to read the ids from either (e.g. a prior partial run already cleared
+    # it). UrlNamespace only gives us the site's path, not its ids - resolve the rest from Graph
+    # directly by that path instead of guessing.
+    param($Token, $UrlNamespace)
+    if ($UrlNamespace -notmatch '^https://([^/]+)/sites/([^/]+)/') { return $null }
+    $hostname = $Matches[1]; $sitePath = $Matches[2]
+    $headers = @{ Authorization = "Bearer $Token" }
+    $site = Invoke-RestMethod -Headers $headers -Uri "https://graph.microsoft.com/v1.0/sites/${hostname}:/sites/${sitePath}"
+    $lists = Invoke-RestMethod -Headers $headers -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/lists"
+    $docLib = $lists.value | Where-Object { $_.list.template -eq 'documentLibrary' } | Select-Object -First 1
+    if (-not $docLib) { return $null }
+    $ids = $site.id -split ','
+    return [pscustomobject]@{ SiteId = $ids[1]; WebId = $ids[2]; ListId = $docLib.id; WebUrl = $site.webUrl }
 }
 #endregion
 
@@ -436,14 +615,41 @@ try {
     }
 
     #region Removals
-    # Libraries to disconnect this run - local folder deletion is deferred until after OneDrive
-    # has been restarted and given real time to settle (see Wait-ForOneDriveToSettle below).
+    # Libraries to disconnect this run - the actual disconnect (stop OneDrive, clear its own
+    # state, unregister the sync root, restart, verify) happens together in one block below,
+    # not per-library here, since it only needs to stop/restart OneDrive once for the whole batch.
     $toDisconnect = @()
 
-    # Actually-synced libraries for sites the user is no longer a Team member of.
+    # Actually-synced libraries for sites the user is no longer a Team member of. Matched by site
+    # path rather than $lib.SiteId - UrlNamespace carries no ids of its own (see Get-SyncedLibraries),
+    # so SiteId is always null here; $desired is keyed by the real SiteId from Graph, and
+    # ContainsKey(null) throws rather than just returning false.
+    $desiredSitePaths = @{}
+    foreach ($d in $desired.Values) {
+        $path = Get-SitePathFromUrl -Url $d.Info.WebUrl
+        if ($path) { $desiredSitePaths[$path.ToLowerInvariant()] = $true }
+    }
+    # Only ever disconnect a library this tool itself previously added via TenantAutoMount - never
+    # something merely "not currently desired," which is not the same as "ours to manage." Caught
+    # for real in a live SYSTEM-context test on 2026-09-01: matching on "not desired" alone wrongly
+    # flagged both the user's personal OneDrive root (its /personal/ UrlNamespace doesn't match
+    # /sites/, so Get-SitePathFromUrl returns null - "no site path" got treated as "not desired")
+    # and a private Team channel the user still has synced (its own distinct site path this tool
+    # never automounted, so it can never appear in $desired either, even though the parent Team
+    # itself is still desired). Restricting candidates to "was in $autoMounted before this run"
+    # means the tool only ever touches what it itself put there.
+    $autoMountedSitePaths = @{}
+    foreach ($entry in $autoMounted) {
+        if ($entry.Data -match 'webUrl=([^&]+)') {
+            $path = Get-SitePathFromUrl -Url $Matches[1]
+            if ($path) { $autoMountedSitePaths[$path.ToLowerInvariant()] = $true }
+        }
+    }
     foreach ($lib in $synced) {
-        if (-not $desired.ContainsKey($lib.SiteId)) {
-            Disconnect-SyncedLibrary -Library $lib
+        $sitePath = Get-SitePathFromUrl -Url $lib.UrlNamespace
+        if (-not $sitePath) { continue }
+        if (-not $autoMountedSitePaths.ContainsKey($sitePath.ToLowerInvariant())) { continue }
+        if (-not $desiredSitePaths.ContainsKey($sitePath.ToLowerInvariant())) {
             $toDisconnect += $lib
         }
     }
@@ -459,6 +665,11 @@ try {
     # Channel-vs-team conflicts: a channel-specific folder already synced for a site where we
     # actually want the main library instead. Resolve (or prompt for) these before the additions
     # pass below, per an approved swap.
+    # Pre-existing limitation, not introduced by the disconnect rework above: $_.SiteId/.ListId on
+    # $synced entries are unresolved (UrlNamespace alone doesn't carry them - same reason
+    # Get-SitePathFromUrl exists), so $existingForSite below never actually matches anything and
+    # this conflict detection is currently inert. It has never worked in production since this
+    # bug predates today's changes; fixing it is a separate task from making disconnect reliable.
     foreach ($siteId in $desired.Keys) {
         $info = $desired[$siteId].Info
         $existingForSite = $synced | Where-Object { $_.SiteId -eq $siteId }
@@ -469,7 +680,7 @@ try {
         if ($channelSynced) {
             $decision = $decisions[$siteId]
             if ($decision -and $decision.decision -eq 'approved') {
-                foreach ($c in $channelSynced) { Disconnect-SyncedLibrary -Library $c; $toDisconnect += $c }
+                foreach ($c in $channelSynced) { $toDisconnect += $c }
             } elseif ($decision -and $decision.decision -eq 'rejected') {
                 Write-Log "Skipping $($desired[$siteId].DisplayName) - user previously rejected the channel->team swap"
                 $desired.Remove($siteId)
@@ -480,23 +691,87 @@ try {
             }
         }
     }
+
+    # Remove each disconnect target's own TenantAutoMount policy entry first - a policy-mounted
+    # library is silently re-added by OneDrive on its own schedule as long as that entry exists,
+    # regardless of anything else done to it below. Registry-only, safe to do before OneDrive is
+    # even stopped.
+    foreach ($lib in $toDisconnect) {
+        if ($lib.UrlNamespace -match '^https://[^/]+/sites/([^/]+)/') {
+            $sitePath = $Matches[1]
+            $match = $autoMounted | Where-Object { $_.Data -match [regex]::Escape("/sites/$sitePath") } | Select-Object -First 1
+            if ($match) { Remove-AutoMountEntry -SiteId $match.SiteId }
+        }
+    }
     #endregion
 
+    #region Disconnect - verified, all-or-nothing per batch
+    # The sequence below is the only one confirmed, end to end and under real hydrated content
+    # on a live tenant, to durably disconnect a library: OneDrive rebuilds SyncEngines and the
+    # Cloud Filter sync-root registration FROM its own ini-based state on every start, so clearing
+    # only the registry mirrors (as earlier versions of this script did) doesn't stick - OneDrive
+    # just re-registers everything from that ini state on the next restart. Local folder deletion
+    # only happens after CfGetSyncRootInfoByPath itself confirms the unregistration took - an
+    # unverified or error state always leaves the local folder in place. Leaving local cruft
+    # behind is an acceptable outcome here; deleting a file OneDrive still thinks is live is not
+    # (two real production incidents already came from exactly that).
     if ($toDisconnect.Count -gt 0) {
-        Wait-ForOneDriveToSettle
-        Remove-StaleLocalFolders -Libraries $toDisconnect
+        $verified = @()
+        $oneDriveStopped = $false
+        try {
+            Stop-OneDriveProcess
+            $oneDriveStopped = $true
+            foreach ($lib in $toDisconnect) {
+                $ids = Get-LibrarySiteIdentifiers -Token $token -Library $lib -AutoMounted $autoMounted
+                if (-not $ids) { throw "Could not resolve site identifiers for $($lib.UrlNamespace) - aborting this disconnect batch." }
+                Remove-OneDriveDeepSyncState -SyncId $lib.SyncId -SiteId $ids.SiteId -ListId $ids.ListId
+                Invoke-UnregisterSyncRoot -Path $lib.MountPoint
+            }
+        } catch {
+            Write-Log "ERROR during disconnect cleanup: $($_.Exception.Message) - local folders will be left in place."
+        } finally {
+            if ($oneDriveStopped) { Start-OneDriveProcess }
+        }
+
+        foreach ($lib in $toDisconnect) {
+            try {
+                if (Test-SyncRootRegistered -Path $lib.MountPoint) {
+                    Write-Log "Still registered as a sync root after disconnect attempt - leaving local folder: $($lib.MountPoint)"
+                } else {
+                    $verified += $lib
+                }
+            } catch {
+                Write-Log "ERROR verifying disconnect for $($lib.MountPoint): $($_.Exception.Message) - leaving local folder."
+            }
+        }
+
+        if ($verified.Count -gt 0) { Remove-StaleLocalFolders -Libraries $verified }
     }
+    #endregion
 
     #region Additions
     # Re-read auto-mount state in case the removals pass above cleared an entry we're about to
     # recreate below with fresh data (e.g. a resolved channel/team conflict).
     $autoMounted = @(Get-AutoMountEntries)
+    $addedAny = $false
     foreach ($siteId in $desired.Keys) {
         $info = $desired[$siteId].Info
         $existing = $autoMounted | Where-Object { $_.SiteId -eq $siteId }
         $alreadySynced = ($synced | Where-Object { $_.SiteId -eq $siteId -and $_.ListId -eq $info.ListId })
         if ($existing -or $alreadySynced) { continue }
         Set-AutoMountEntry -SiteId $info.SiteId -WebId $info.WebId -ListId $info.ListId -WebUrl $info.WebUrl -DisplayName $desired[$siteId].DisplayName
+        $addedAny = $true
+    }
+
+    if ($addedAny) {
+        # Always restart here even if the removals pass above already restarted OneDrive once -
+        # that earlier restart ran before these entries existed, so it couldn't have picked them
+        # up. Reset the timer first so this restart's own AutoMountTeamSites check isn't itself
+        # skipped by the cooldown.
+        Reset-AutoMountTimer
+        Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $UserContext.SessionId } | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 5
+        Start-ProcessInUserSession -SessionId $UserContext.SessionId -CommandLine "`"$(Get-OneDriveExePath)`" /background"
     }
     #endregion
 
