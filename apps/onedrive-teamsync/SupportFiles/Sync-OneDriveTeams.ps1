@@ -525,10 +525,17 @@ function Reset-AutoMountTimer {
 }
 
 function Get-CurrentUserTeams {
+    # Any Microsoft 365 Group the user belongs to, not just ones that have gone through Teams
+    # provisioning - the tool was never meant to require that. Filtering on
+    # resourceProvisioningOptions -contains 'Team' excluded a real group the user created and
+    # was a member of, because Teams-specific provisioning is a separate, sometimes-delayed step
+    # from the group (and its SharePoint site) actually existing - groupTypes -contains 'Unified'
+    # is what actually distinguishes an M365 Group (has a SharePoint site) from a plain security
+    # group (doesn't), independent of whether it's also been made into a Team.
     param($Token, $Upn)
     $headers = @{ Authorization = "Bearer $Token" }
-    $groups = Invoke-RestMethod -Headers $headers -Uri "https://graph.microsoft.com/v1.0/users/$Upn/memberOf?`$select=id,displayName,resourceProvisioningOptions"
-    return $groups.value | Where-Object { $_.resourceProvisioningOptions -contains 'Team' }
+    $groups = Invoke-RestMethod -Headers $headers -Uri "https://graph.microsoft.com/v1.0/users/$Upn/memberOf?`$select=id,displayName,groupTypes"
+    return $groups.value | Where-Object { $_.groupTypes -contains 'Unified' }
 }
 
 function Get-TeamSiteInfo {
