@@ -376,8 +376,21 @@ function Stop-OneDriveProcess {
 }
 
 function Start-OneDriveProcess {
-    Write-Log "Restarting OneDrive."
-    Start-ProcessInUserSession -SessionId $UserContext.SessionId -CommandLine "`"$(Get-OneDriveExePath)`" /background"
+    # CreateProcessAsUser (via Start-ProcessInUserSession) can report success with no Win32 error
+    # while the launched process never actually ends up running - confirmed for real more than
+    # once tonight (a team's ADD-path restart, and this same restart after a successful
+    # disconnect), leaving OneDrive fully stopped with no indication anything was wrong. Verify it
+    # actually came up and retry rather than trusting a single launch call silently.
+    param([int]$MaxAttempts = 5, [int]$CheckDelaySeconds = 5)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Write-Log "Restarting OneDrive (attempt $attempt of $MaxAttempts)."
+        Start-ProcessInUserSession -SessionId $UserContext.SessionId -CommandLine "`"$(Get-OneDriveExePath)`" /background"
+        Start-Sleep -Seconds $CheckDelaySeconds
+        if (Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $UserContext.SessionId }) {
+            return
+        }
+    }
+    Write-Log "ERROR: OneDrive did not start after $MaxAttempts attempts - it is left stopped."
 }
 
 # Cloud Filter API (cldapi.dll) - the public Win32 API any cloud-sync provider (OneDrive included)
@@ -823,7 +836,7 @@ try {
         Reset-AutoMountTimer
         Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $UserContext.SessionId } | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 5
-        Start-ProcessInUserSession -SessionId $UserContext.SessionId -CommandLine "`"$(Get-OneDriveExePath)`" /background"
+        Start-OneDriveProcess
     }
     #endregion
 
