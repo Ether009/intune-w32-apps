@@ -679,12 +679,27 @@ try {
         }
     }
 
-    # Auto-mount entries we previously set for sites no longer desired - doesn't retroactively
-    # unsync anything already synced, but keeps our own authored list accurate.
+    # Auto-mount entries we previously set for sites no longer desired. Safe to remove immediately
+    # ONLY when nothing is actually synced for that site - if something is, removing this now and
+    # having the actual disconnect fail afterward (OneDrive not stopping in time, etc.) would
+    # permanently orphan the library: with nothing left in $autoMounted, "only touch what the tool
+    # itself put there" (above) would refuse to ever recognize it as a disconnect candidate again.
+    # Confirmed for real: a failed disconnect attempt removed this entry anyway, and the still-
+    # fully-synced library was silently skipped on every run afterward. For a site that IS
+    # currently synced, its entry is only removed once the disconnect is verified to have worked -
+    # see the Disconnect region below.
+    $syncedSitePathsNow = @{}
+    foreach ($lib in $synced) {
+        $p = Get-SitePathFromUrl -Url $lib.UrlNamespace
+        if ($p) { $syncedSitePathsNow[$p.ToLowerInvariant()] = $true }
+    }
     foreach ($entry in $autoMounted) {
-        if (-not $desired.ContainsKey($entry.SiteId)) {
-            Remove-AutoMountEntry -SiteId $entry.SiteId
+        if ($desired.ContainsKey($entry.SiteId)) { continue }
+        if ($entry.Data -match 'webUrl=([^&]+)') {
+            $p = Get-SitePathFromUrl -Url $Matches[1]
+            if ($p -and $syncedSitePathsNow.ContainsKey($p.ToLowerInvariant())) { continue }
         }
+        Remove-AutoMountEntry -SiteId $entry.SiteId
     }
 
     # Channel-vs-team conflicts: a channel-specific folder already synced for a site where we
@@ -736,6 +751,7 @@ try {
     # (two real production incidents already came from exactly that).
     if ($toDisconnect.Count -gt 0) {
         $verified = @()
+        $resolvedSiteIds = @{}
         $oneDriveStopped = $false
         try {
             Wait-ForOneDriveStartupToSettle
@@ -744,6 +760,7 @@ try {
             foreach ($lib in $toDisconnect) {
                 $ids = Get-LibrarySiteIdentifiers -Token $token -Library $lib -AutoMounted $autoMounted
                 if (-not $ids) { throw "Could not resolve site identifiers for $($lib.UrlNamespace) - aborting this disconnect batch." }
+                $resolvedSiteIds[$lib.SyncId] = $ids.SiteId
                 Remove-OneDriveDeepSyncState -SyncId $lib.SyncId -SiteId $ids.SiteId -ListId $ids.ListId
                 Invoke-UnregisterSyncRoot -Path $lib.MountPoint
             }
@@ -759,6 +776,12 @@ try {
                     Write-Log "Still registered as a sync root after disconnect attempt - leaving local folder: $($lib.MountPoint)"
                 } else {
                     $verified += $lib
+                    # Only now - confirmed durably disconnected - is it safe to remove the
+                    # TenantAutoMount entry. Removing it any earlier and having the disconnect
+                    # itself fail would orphan a still-live library (see comment above this block).
+                    if ($resolvedSiteIds.ContainsKey($lib.SyncId)) {
+                        Remove-AutoMountEntry -SiteId $resolvedSiteIds[$lib.SyncId]
+                    }
                 }
             } catch {
                 Write-Log "ERROR verifying disconnect for $($lib.MountPoint): $($_.Exception.Message) - leaving local folder."
