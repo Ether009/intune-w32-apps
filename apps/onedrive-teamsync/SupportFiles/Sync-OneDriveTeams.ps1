@@ -335,6 +335,24 @@ function Get-OneDriveExePath {
     return $found
 }
 
+function Wait-ForOneDriveStartupToSettle {
+    # This task's LogonTrigger fires at the same logon event that starts OneDrive itself, so a
+    # disconnect running right at login can end up asking OneDrive to /shutdown while it's still
+    # mid-way through its own sign-in/startup sequence - confirmed for real that this makes
+    # Stop-OneDriveProcess reliably time out (OneDrive busy with its own boot work, not hung), and
+    # visibly slows the user's own sign-in as a side effect of the resulting contention. Wait for
+    # OneDrive to have been running continuously for a minimum uptime before treating it as safe
+    # to stop, rather than assuming "the process exists" already means "it's idle."
+    param([int]$MinUptimeSeconds = 60, [int]$MaxWaitSeconds = 150)
+    $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $proc = Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $UserContext.SessionId } | Select-Object -First 1
+        if ($proc -and ((Get-Date) - $proc.StartTime).TotalSeconds -ge $MinUptimeSeconds) { return }
+        Start-Sleep -Seconds 5
+    }
+    Write-Log "OneDrive did not reach $MinUptimeSeconds seconds of stable uptime within $MaxWaitSeconds seconds - proceeding anyway."
+}
+
 function Stop-OneDriveProcess {
     param([int]$TimeoutSeconds = 30)
     Write-Log "Stopping OneDrive."
@@ -699,17 +717,11 @@ try {
         }
     }
 
-    # Remove each disconnect target's own TenantAutoMount policy entry first - a policy-mounted
-    # library is silently re-added by OneDrive on its own schedule as long as that entry exists,
-    # regardless of anything else done to it below. Registry-only, safe to do before OneDrive is
-    # even stopped.
-    foreach ($lib in $toDisconnect) {
-        if ($lib.UrlNamespace -match '^https://[^/]+/sites/([^/]+)/') {
-            $sitePath = $Matches[1]
-            $match = $autoMounted | Where-Object { $_.Data -match [regex]::Escape("/sites/$sitePath") } | Select-Object -First 1
-            if ($match) { Remove-AutoMountEntry -SiteId $match.SiteId }
-        }
-    }
+    # Every $toDisconnect candidate is, by construction above, already in $autoMountedSitePaths
+    # and not in $desiredSitePaths - exactly the condition the auto-mount cleanup loop above
+    # already removes by SiteId. A separate site-path-matched removal here used to duplicate that
+    # (visible as the same site logged twice), so there's nothing left to do for this specific
+    # case; kept as a region marker since Additions below still expects one.
     #endregion
 
     #region Disconnect - verified, all-or-nothing per batch
@@ -726,6 +738,7 @@ try {
         $verified = @()
         $oneDriveStopped = $false
         try {
+            Wait-ForOneDriveStartupToSettle
             Stop-OneDriveProcess
             $oneDriveStopped = $true
             foreach ($lib in $toDisconnect) {
