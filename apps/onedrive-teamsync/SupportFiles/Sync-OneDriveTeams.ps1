@@ -354,9 +354,18 @@ function Wait-ForOneDriveStartupToSettle {
 }
 
 function Stop-OneDriveProcess {
+    # Graceful "/shutdown" (launched via Start-ProcessInUserSession) relies on OneDrive noticing
+    # and acting on the request through its own message loop - confirmed for real that this
+    # reliably times out when OneDrive is internally busy (e.g. still retrying against a library
+    # whose access was just revoked), regardless of how long it's already been running for. A
+    # direct Stop-Process -Force, called straight from this SYSTEM process against the PID, is a
+    # hard OS-level termination that doesn't depend on OneDrive being responsive at all, and needs
+    # no impersonation since terminating an existing process by PID isn't the same as starting a
+    # new one inside the user's session. Wait-ForOneDriveStartupToSettle already guarantees this
+    # isn't run against a still-mid-startup process, which is what made a hard kill risky before.
     param([int]$TimeoutSeconds = 30)
     Write-Log "Stopping OneDrive."
-    Start-ProcessInUserSession -SessionId $UserContext.SessionId -CommandLine "`"$(Get-OneDriveExePath)`" /shutdown"
+    Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $UserContext.SessionId } | Stop-Process -Force -ErrorAction SilentlyContinue
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $UserContext.SessionId }) -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 300
