@@ -99,14 +99,14 @@ param
 $adtSession = @{
     AppVendor = 'Organization'
     AppName = 'OneDrive Team Sync'
-    AppVersion = '2.1.5'
+    AppVersion = '2.2.0'
     AppArch = 'x64'
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '2.1.5'
+    AppScriptVersion = '2.2.0'
     AppScriptDate = '2026-08-31'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -182,6 +182,12 @@ function Register-LogonTask
     # task). The XML form's own registration path has proven more reliable than the newer
     # PowerShell cmdlets for this scenario generally, independent of that specific bug.
     #
+    # Repeats hourly for the life of the logon session, not just once at logon: with site/list ids
+    # cached locally, a steady-state run costs one token request plus a single /memberOf call, so
+    # picking up membership changes during the day is cheap. Adds apply on their own (OneDrive
+    # re-reads the auto-mount list itself); removals wait for OneDrive to be closed, which the
+    # user is notified about and can trigger from the notification.
+    #
     # Runs as SYSTEM (S-1-5-18), not as the logged-on user: the AutoMountTeamSites registry path
     # the sync script writes to is writable only by SYSTEM/Administrators, confirmed via a real
     # ACL check - not even the user it acts on behalf of can write it. The script itself resolves
@@ -194,6 +200,10 @@ function Register-LogonTask
   <Triggers>
     <LogonTrigger>
       <Enabled>true</Enabled>
+      <Repetition>
+        <Interval>PT1H</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
     </LogonTrigger>
   </Triggers>
   <Principals>
