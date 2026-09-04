@@ -594,30 +594,14 @@ function Get-CurrentUserUpn {
     foreach ($account in Get-ChildItem $accountsPath) {
         $props = Get-ItemProperty $account.PSPath -ErrorAction SilentlyContinue
         if ($props.ConfiguredTenantId -eq $TenantId -and $props.UserEmail) {
-            # Stashed for Reset-AutoMountTimer/Remove-OneDriveDeepSyncState below - avoids
-            # re-deriving which Accounts\Business* key belongs to this tenant a second time.
-            $script:OneDriveAccountPath = $account.PSPath
+            # Stashed for Remove-OneDriveDeepSyncState below - avoids re-deriving which
+            # Accounts sub-key belongs to this tenant a second time.
             $script:OneDriveAccountName = $account.PSChildName
             $script:OneDriveOneAuthAccountId = $props.OneAuthAccountId
             return $props.UserEmail
         }
     }
     throw "No OneDrive account configured for tenant $TenantId under the user's hive."
-}
-
-function Reset-AutoMountTimer {
-    # OneDrive throttles its own AutoMountTeamSites processing to roughly every 8 hours via an
-    # internal cooldown timestamp (undocumented, found via https://call4cloud.nl/timer-automount-of-onedrive-team-sites/
-    # and confirmed for real on this tenant: a freshly-added, verified-correct TenantAutoMount
-    # entry sat unprocessed through a full OneDrive restart AND a full device reboot+relogin,
-    # because this timer - not process/session state - is what actually gates the check).
-    # TimerAutoMount holds the epoch-seconds timestamp of the last check; OneDrive only re-checks
-    # once ~8h have passed since. Resetting it to 1 makes the next check look overdue, so the
-    # OneDrive restart that follows picks up new entries immediately instead of silently waiting
-    # out the rest of that window.
-    if (-not $script:OneDriveAccountPath) { return }
-    Write-Log "Resetting OneDrive AutoMountTeamSites cooldown timer to force immediate pickup."
-    Set-ItemProperty -LiteralPath $script:OneDriveAccountPath -Name TimerAutoMount -Value 1 -Type QWord -ErrorAction SilentlyContinue
 }
 
 function Get-CurrentUserTeams {
@@ -944,25 +928,23 @@ try {
     #region Additions
     # Re-read auto-mount state in case the removals pass above cleared an entry we're about to
     # recreate below with fresh data (e.g. a resolved channel/team conflict).
+    #
+    # Nothing is done to make OneDrive notice sooner: it re-reads the auto-mount list on its own
+    # schedule and picks new entries up within a few hours, confirmed on a real device. Writing the
+    # entry is the whole job here. An earlier version also zeroed OneDrive's TimerAutoMount cooldown
+    # to force an immediate check - that write silently never took effect from SYSTEM, and since the
+    # library mounts on its own anyway and the latency doesn't matter, it was dropped rather than
+    # fixed. Adds only have to converge eventually, not promptly - some users go a year without a
+    # reboot, which is why this runs hourly rather than only at logon.
     $autoMounted = @(Get-AutoMountEntries)
-    $addedAny = $false
     foreach ($siteId in $desired.Keys) {
         $info = $desired[$siteId].Info
         $existing = $autoMounted | Where-Object { $_.SiteId -eq $siteId }
         $alreadySynced = ($synced | Where-Object { $_.SiteId -eq $siteId -and $_.ListId -eq $info.ListId })
         if ($existing -or $alreadySynced) { continue }
         Set-AutoMountEntry -SiteId $info.SiteId -WebId $info.WebId -ListId $info.ListId -WebUrl $info.WebUrl -DisplayName $desired[$siteId].DisplayName
-        $addedAny = $true
     }
 
-    if ($addedAny) {
-        # No restart: OneDrive re-reads the auto-mount list on its own schedule while running, and
-        # resetting the cooldown timestamp is enough to make that next check happen promptly rather
-        # than waiting out the rest of its ~8h window. Adding a library isn't urgent enough to
-        # justify closing OneDrive underneath someone, especially now that this runs periodically
-        # rather than only at logon - it just appears within OneDrive's next check.
-        Reset-AutoMountTimer
-    }
     #endregion
 
     # The toast's button stops OneDrive on the user's behalf and leaves it to this script to start
