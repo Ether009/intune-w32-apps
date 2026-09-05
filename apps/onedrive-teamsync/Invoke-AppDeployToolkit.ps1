@@ -99,14 +99,14 @@ param
 $adtSession = @{
     AppVendor = 'Organization'
     AppName = 'OneDrive Team Sync'
-    AppVersion = '2.3.0'
+    AppVersion = '2.4.0'
     AppArch = 'x64'
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '2.3.0'
+    AppScriptVersion = '2.4.0'
     AppScriptDate = '2026-08-31'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -156,22 +156,6 @@ function Install-TeamSyncCertificate
     $securePw = ConvertTo-SecureString -String $PfxPassword -Force -AsPlainText
     $cert = Import-PfxCertificate -FilePath $PfxPath -CertStoreLocation 'Cert:\LocalMachine\My' -Password $securePw -Exportable:$false
     return $cert.Thumbprint
-}
-
-function Register-ToastProtocolHandler
-{
-    # Registered machine-wide (any user) so a toast notification's Yes/No buttons can call back
-    # into the sync script, since a script-hosted toast has no native activation callback of its
-    # own outside a full packaged app.
-    $classesPath = 'HKLM:\SOFTWARE\Classes\odteamsync'
-    New-Item -Path $classesPath -Force | Out-Null
-    Set-ItemProperty -Path $classesPath -Name '(Default)' -Value 'URL:OneDrive Team Sync Protocol'
-    New-ItemProperty -Path $classesPath -Name 'URL Protocol' -Value '' -PropertyType String -Force | Out-Null
-
-    $commandPath = "$classesPath\shell\open\command"
-    New-Item -Path $commandPath -Force | Out-Null
-    $callbackCommand = "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -NonInteractive -File `"$ScriptDest`" -ToastCallback `"%1`""
-    Set-ItemProperty -Path $commandPath -Name '(Default)' -Value $callbackCommand
 }
 
 function Register-LogonTask
@@ -301,7 +285,12 @@ function Install-ADTDeployment
     Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $pfxPasswordPath -Force -ErrorAction SilentlyContinue
 
-    Register-ToastProtocolHandler
+    # Earlier versions registered an odteamsync:// protocol handler so a toast's buttons could call
+    # back into the sync script. The script shows no toasts at all any more (their buttons never
+    # rendered), so this is removed on upgrade rather than left behind as a machine-wide handler
+    # pointing at a -ToastCallback parameter the script no longer even accepts.
+    Remove-Item -Path 'HKLM:\SOFTWARE\Classes\odteamsync' -Recurse -Force -ErrorAction SilentlyContinue
+
     Register-LogonTask
 
 
