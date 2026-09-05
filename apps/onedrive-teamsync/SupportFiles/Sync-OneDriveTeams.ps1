@@ -16,8 +16,10 @@ $CertThumbprint = '5ACD0E673C1D5DA72BB2497C37D74A7F67F7AF25'
 function Get-InteractiveUserContext {
     # explorer.exe only runs in an interactive user's own session, never SYSTEM's or a service
     # session - its owner and session ID reliably identify "the person actually sitting here."
+    # Returns $null rather than throwing when nobody is signed in: the hourly trigger fires
+    # regardless of sessions, so "no interactive user" is a normal outcome, not an error.
     $proc = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
-    if (-not $proc) { throw "No interactive user session found (explorer.exe not running)." }
+    if (-not $proc) { return $null }
     $ownerSid = (Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid).Sid
 
     $profilePath = (Get-ItemProperty -LiteralPath "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$ownerSid").ProfileImagePath
@@ -34,6 +36,13 @@ function Get-InteractiveUserContext {
 #endregion
 
 $UserContext = Get-InteractiveUserContext
+if (-not $UserContext) {
+    # Nobody signed in. There is no user whose libraries could be synced, and no per-user profile
+    # to even write a log into, so there is nothing useful to record. Exit 0 rather than failing:
+    # the hourly trigger runs whether or not anyone is logged on, and an overnight machine would
+    # otherwise fill Task Scheduler history with failures that mean nothing.
+    exit 0
+}
 $LogDir = Join-Path $UserContext.LocalAppData 'OneDriveTeamSync'
 $LogFile = Join-Path $LogDir 'sync.log'
 $SiteCacheFile = Join-Path $LogDir 'sitecache.json'
@@ -183,10 +192,6 @@ function Get-CurrentUserUpn {
     foreach ($account in Get-ChildItem $accountsPath) {
         $props = Get-ItemProperty $account.PSPath -ErrorAction SilentlyContinue
         if ($props.ConfiguredTenantId -eq $TenantId -and $props.UserEmail) {
-            # Stashed for Remove-OneDriveDeepSyncState below - avoids re-deriving which
-            # Accounts sub-key belongs to this tenant a second time.
-            $script:OneDriveAccountName = $account.PSChildName
-            $script:OneDriveOneAuthAccountId = $props.OneAuthAccountId
             return $props.UserEmail
         }
     }

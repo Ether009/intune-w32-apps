@@ -99,14 +99,14 @@ param
 $adtSession = @{
     AppVendor = 'Organization'
     AppName = 'OneDrive Team Sync'
-    AppVersion = '2.4.0'
+    AppVersion = '2.4.1'
     AppArch = 'x64'
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '2.4.0'
+    AppScriptVersion = '2.4.1'
     AppScriptDate = '2026-08-31'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -158,7 +158,7 @@ function Install-TeamSyncCertificate
     return $cert.Thumbprint
 }
 
-function Register-LogonTask
+function Register-SyncTask
 {
     # Built and registered via schtasks.exe /create /xml rather than the ScheduledTasks module -
     # Register-ScheduledTask with a GroupId principal silently failed to persist the task on a
@@ -166,11 +166,24 @@ function Register-LogonTask
     # task). The XML form's own registration path has proven more reliable than the newer
     # PowerShell cmdlets for this scenario generally, independent of that specific bug.
     #
-    # Repeats hourly for the life of the logon session, not just once at logon: with site/list ids
-    # cached locally, a steady-state run costs one token request plus a single /memberOf call, so
-    # picking up membership changes during the day is cheap. Adds apply on their own (OneDrive
-    # re-reads the auto-mount list itself); removals wait for OneDrive to be closed, which the
-    # user is notified about and can trigger from the notification.
+    # Two independent triggers, each doing exactly one thing:
+    #
+    #   LogonTrigger - a plain run at logon, so a user who has just signed in converges promptly.
+    #   TimeTrigger  - hourly, forever, regardless of who is or isn't signed in.
+    #
+    # They are deliberately NOT one trigger. An earlier version put <Repetition> on the
+    # LogonTrigger, which looked equivalent and was not: a repetition is a property of a trigger
+    # that has *fired*, so re-registering the task (which every app update does - it deletes and
+    # recreates it) left the repetition dormant until the user's next logon. Confirmed on a real
+    # device: an update at 20:06 silently stopped the hourly runs, and Task Scheduler reported the
+    # task as Ready with LastRunTime 11/30/1999 and no NextRunTime. For the users this exists for -
+    # the ones who go months without signing out - an update could park the tool indefinitely.
+    # A TimeTrigger arms at registration and does not care about sessions, so it cannot regress
+    # that way.
+    #
+    # Hourly is affordable because site/list ids are cached locally: a steady-state run costs one
+    # token request plus a single /memberOf call. StartWhenAvailable catches up a run that was
+    # missed because the machine was asleep, which laptops here do constantly.
     #
     # Runs as SYSTEM (S-1-5-18), not as the logged-on user: the AutoMountTeamSites registry path
     # the sync script writes to is writable only by SYSTEM/Administrators, confirmed via a real
@@ -178,17 +191,26 @@ function Register-LogonTask
     # the actual interactive user (via explorer.exe's owning SID) and operates on their
     # HKEY_USERS hive explicitly rather than relying on HKCU, which under SYSTEM would just be
     # SYSTEM's own (irrelevant) profile.
+    # Local time, no offset - Task Scheduler treats an unsuffixed StartBoundary as local. Anchoring
+    # it at install time (rather than a fixed date) keeps the hourly slot spread across the fleet
+    # by whenever each device happened to install, instead of every device calling Graph on the hour.
+    $startBoundary = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+
     $xml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers>
     <LogonTrigger>
       <Enabled>true</Enabled>
+    </LogonTrigger>
+    <TimeTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>$startBoundary</StartBoundary>
       <Repetition>
         <Interval>PT1H</Interval>
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
-    </LogonTrigger>
+    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">
@@ -200,6 +222,7 @@ function Register-LogonTask
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
     <Hidden>true</Hidden>
     <ExecutionTimeLimit>PT45M</ExecutionTimeLimit>
   </Settings>
@@ -291,7 +314,7 @@ function Install-ADTDeployment
     # pointing at a -ToastCallback parameter the script no longer even accepts.
     Remove-Item -Path 'HKLM:\SOFTWARE\Classes\odteamsync' -Recurse -Force -ErrorAction SilentlyContinue
 
-    Register-LogonTask
+    Register-SyncTask
 
 
     ##================================================
@@ -353,7 +376,7 @@ function Repair-ADTDeployment
     ## MARK: Repair
     ##================================================
     $adtSession.InstallPhase = $adtSession.DeploymentType
-    Register-LogonTask
+    Register-SyncTask
 }
 
 
