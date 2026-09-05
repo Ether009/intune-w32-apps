@@ -12,8 +12,18 @@ $ClientId = '7a8d6e5a-734c-44ce-8673-3f7c05c47421'
 $CertThumbprint = '5ACD0E673C1D5DA72BB2497C37D74A7F67F7AF25'
 
 # How long a run with pending disconnect work waits for OneDrive to be closed before giving up and
-# leaving it for the next run. Kept well inside the scheduled task's own 45-minute execution limit.
-$DisconnectWaitMinutes = 30
+# leaving it for the next run. Deliberately short: the run repeats hourly, so a close that happens
+# outside this window is simply picked up by the next run, and there is no reason to hold a SYSTEM
+# PowerShell process open for half of every hour waiting for something that usually will not happen
+# during the wait anyway. It only needs to be long enough to catch someone acting on the toast.
+$DisconnectWaitMinutes = 5
+
+# How often to re-tell the user about disconnect work that is still waiting on them. Without this
+# the notification fired once per *change* of the pending set, which in practice meant exactly one
+# notification ever: a real day's log showed one at 15:23 and then six hourly runs that said
+# nothing, because the pending set never changed. Since nothing can proceed until the user closes
+# OneDrive, a reminder they missed once is a flow that never completes.
+$RenotifyHours = 4
 
 # AppUserModelID the toasts are shown under. This MUST be an AUMID Windows already has registered,
 # and it is not free-form: an unregistered string makes CreateToastNotifier(...).Show() succeed with
@@ -381,7 +391,17 @@ function Show-DisconnectPendingToast {
     # Disconnecting a library can only be done while OneDrive is stopped (its own sync engine holds
     # the sync root open - CfUnregisterSyncRoot fails outright otherwise), and force-stopping it
     # underneath someone mid-work isn't acceptable on a repeating schedule. So tell them what
-    # happened and let them trigger the restart when it suits, rather than doing it to them.
+    # happened and let them stop OneDrive when it suits, rather than doing it to them.
+    #
+    # No action buttons, deliberately. Measured on a real device: toasts from this script render
+    # reliably, but their <actions> are silently dropped - no buttons appeared for a custom
+    # protocol, for a known-good system protocol (ms-settings:), or under three different
+    # AppUserModelIDs. Interactive toasts from a classic Win32 process need an AUMID backed by the
+    # calling app's own Start Menu shortcut (and, for activation, a registered COM activator);
+    # borrowing someone else's registered AUMID gets the toast shown but not its buttons. Rather
+    # than ship a button that silently does not exist, the instruction lives in the text. The
+    # user quitting OneDrive from the tray is what actually completes the disconnect, and that
+    # path is watched for and proven to work end to end.
     param([string[]]$Names)
     $what = if ($Names.Count -eq 1) { "`"$(ConvertTo-XmlText $Names[0])`" is no longer shared with you" }
             else { "$($Names.Count) SharePoint libraries are no longer shared with you" }
@@ -390,13 +410,9 @@ function Show-DisconnectPendingToast {
   <visual>
     <binding template="ToastGeneric">
       <text>OneDrive sync needs to finish an update</text>
-      <text>$what and will be removed from your synced folders. OneDrive needs to restart to finish this.</text>
+      <text>$what and will be removed from your synced folders. To finish, right-click the OneDrive cloud icon in the taskbar and choose "Quit OneDrive" when convenient - it will restart on its own.</text>
     </binding>
   </visual>
-  <actions>
-    <action content="Restart OneDrive now" arguments="odteamsync://restart-onedrive" activationType="protocol" />
-    <action content="Later" arguments="odteamsync://dismiss" activationType="protocol" />
-  </actions>
 </toast>
 "@
 }
@@ -908,7 +924,18 @@ try {
         $signature = (($toDisconnect | ForEach-Object { $_.MountPoint } | Sort-Object) -join '|')
         $oneDriveWasRunning = [bool](Get-OneDriveProcess)
 
-        if ($oneDriveWasRunning -and $pending['signature'] -ne $signature) {
+        # Notify when the pending set changes, and again every $RenotifyHours while it is still
+        # waiting on the user. An unparseable or missing timestamp counts as "due" rather than
+        # "recent", so a corrupt state file produces an extra notification instead of silence.
+        $notifyDue = $pending['signature'] -ne $signature
+        if (-not $notifyDue -and $pending['notifiedAt']) {
+            try { $notifyDue = ([datetime]::Parse($pending['notifiedAt'])).AddHours($RenotifyHours) -lt (Get-Date) }
+            catch { $notifyDue = $true }
+        } elseif (-not $notifyDue) {
+            $notifyDue = $true
+        }
+
+        if ($oneDriveWasRunning -and $notifyDue) {
             Write-Log "Disconnect pending for $($toDisconnect.Count) librarie(s) - notifying the user."
             Show-DisconnectPendingToast -Names @($toDisconnect | ForEach-Object { if ($_.MountPoint) { Split-Path $_.MountPoint -Leaf } else { $_.UrlNamespace } })
             $pending['signature'] = $signature
