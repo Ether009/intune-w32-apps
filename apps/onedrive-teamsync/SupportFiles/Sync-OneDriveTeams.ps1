@@ -15,6 +15,21 @@ $CertThumbprint = '5ACD0E673C1D5DA72BB2497C37D74A7F67F7AF25'
 # leaving it for the next run. Kept well inside the scheduled task's own 45-minute execution limit.
 $DisconnectWaitMinutes = 30
 
+# AppUserModelID the toasts are shown under. This MUST be an AUMID Windows already has registered,
+# and it is not free-form: an unregistered string makes CreateToastNotifier(...).Show() succeed with
+# no error at all while the notification platform silently discards the toast - which is exactly why
+# no toast from this script had ever appeared. Verified on a real device: with the old
+# 'OneDrive Team Sync' nothing rendered and no key existed under
+# HKCU\...\Notifications\Settings, while this one rendered immediately.
+#
+# Borrowing OneDrive's own identity is deliberate rather than lazy: every toast here is about
+# OneDrive needing to be closed or restarted, so "OneDrive" is the honest sender from the user's
+# point of view. Registering a distinct AUMID of our own would need a Start Menu shortcut carrying
+# the System.AppUserModel.ID property (the registry key alone is not enough for a plain Win32
+# process), so if a separate identity is ever wanted, that shortcut has to be installed and tested
+# first - do not simply change this string and assume it works.
+$ToastAppId = 'Microsoft.SkyDrive.Desktop'
+
 # This script runs as SYSTEM (the AutoMountTeamSites registry path is writable only by
 # SYSTEM/Administrators - a standard user, even the one this script is acting on behalf of,
 # cannot write it - confirmed via a real ACL check on a real device). SYSTEM has no "current
@@ -112,7 +127,7 @@ public static class RunAsUser
         IntPtr lpEnvironment, string lpCurrentDirectory, ref STARTUPINFO lpStartupInfo,
         out PROCESS_INFORMATION lpProcessInformation);
 
-    public static void Start(uint sessionId, string commandLine)
+    public static int Start(uint sessionId, string commandLine)
     {
         // Every failure below throws with GetLastError rather than returning bool - a prior
         // version swallowed all of this via "| Out-Null" on the PowerShell side, which let a
@@ -132,23 +147,52 @@ public static class RunAsUser
         }
 
         IntPtr env;
-        CreateEnvironmentBlock(out env, dupToken, false);
+        if (!CreateEnvironmentBlock(out env, dupToken, false))
+        {
+            // Not fatal on its own, but worth being loud about: with a null block the new process
+            // inherits SYSTEM's environment, so %LOCALAPPDATA% and friends point at
+            // config\systemprofile instead of the user's profile.
+            env = IntPtr.Zero;
+        }
 
         var si = new STARTUPINFO();
         si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
-        si.lpDesktop = "winsta0\\default";
+        // MUST be the empty string, not "winsta0\\default" and not null. Measured on a real
+        // machine: with "winsta0\\default" every launch - OneDrive, notepad, anything - was
+        // created successfully (CreateProcessAsUser returns TRUE with a real PID) and was then
+        // killed during startup with exit code 0xC0000142 STATUS_DLL_INIT_FAILED, because a
+        // session-0 caller has that name resolved against session 0's window station, which the
+        // user's session token cannot attach to, so user32's DllMain fails before Main runs. That
+        // is the whole reason "restart OneDrive" used to report success while leaving OneDrive
+        // stopped. null behaved the same way but intermittently; "" is the documented way to say
+        // "give me the default desktop of the token's own session" and was the only value that
+        // worked every time.
+        si.lpDesktop = "";
 
         PROCESS_INFORMATION pi;
-        // CREATE_UNICODE_ENVIRONMENT (0x400) | CREATE_NO_WINDOW (0x08000000)
+        // CREATE_UNICODE_ENVIRONMENT (0x400) | CREATE_NO_WINDOW (0x08000000). The 0x400 is not
+        // optional while an environment block is passed - without it CreateProcessAsUser rejects
+        // the Unicode block with ERROR_INVALID_PARAMETER (87).
+        //
+        // lpCurrentDirectory must also be a real, explicitly named directory. Passing null makes
+        // the child inherit the *caller's* current directory, which is then resolved against the
+        // *user's* token; when SYSTEM's working directory is not something that user can resolve,
+        // CreateProcessAsUser fails outright with ERROR_INVALID_NAME (123) before the image is
+        // ever loaded. The Windows directory is always present and always readable.
+        string workingDir = Environment.GetEnvironmentVariable("SystemRoot");
+        if (string.IsNullOrEmpty(workingDir)) workingDir = "C:\\Windows";
+
         bool ok = CreateProcessAsUser(dupToken, null, commandLine, IntPtr.Zero, IntPtr.Zero, false,
-            0x08000400, env, null, ref si, out pi);
+            0x08000400, env, workingDir, ref si, out pi);
         int createErr = ok ? 0 : Marshal.GetLastWin32Error();
+        int newPid = ok ? pi.dwProcessId : 0;
 
         if (env != IntPtr.Zero) DestroyEnvironmentBlock(env);
         CloseHandle(dupToken);
         CloseHandle(userToken);
         if (ok) { CloseHandle(pi.hProcess); CloseHandle(pi.hThread); }
         if (!ok) throw new System.ComponentModel.Win32Exception(createErr, "CreateProcessAsUser failed for: " + commandLine);
+        return newPid;
     }
 }
 '@
@@ -173,8 +217,12 @@ function Get-InteractiveUserContext {
 }
 
 function Start-ProcessInUserSession {
+    # Logs the PID rather than returning it, so callers stay side-effect free. The PID matters:
+    # a process that is created and then dies during startup looks exactly like a process that
+    # was never created unless you can go back and ask what happened to that specific PID.
     param([Parameter(Mandatory)][uint32]$SessionId, [Parameter(Mandatory)][string]$CommandLine)
-    [RunAsUser]::Start($SessionId, $CommandLine)
+    $newPid = [RunAsUser]::Start($SessionId, $CommandLine)
+    Write-Log "Launched PID $newPid in session ${SessionId}: $CommandLine"
 }
 #endregion
 
@@ -304,7 +352,7 @@ $ToastXml
 `$toastXml = New-Object Windows.Data.Xml.Dom.XmlDocument
 `$toastXml.LoadXml(`$xml.OuterXml)
 `$toast = New-Object Windows.UI.Notifications.ToastNotification `$toastXml
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('OneDrive Team Sync').Show(`$toast)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('$ToastAppId').Show(`$toast)
 "@
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($toastScript))
     Start-ProcessInUserSession -SessionId $UserContext.SessionId -CommandLine "powershell.exe -NoProfile -WindowStyle Hidden -EncodedCommand $encoded"
@@ -434,11 +482,12 @@ function Wait-ForOneDriveToExit {
 }
 
 function Start-OneDriveProcess {
-    # CreateProcessAsUser (via Start-ProcessInUserSession) can report success with no Win32 error
-    # while the launched process never actually ends up running - confirmed for real more than
-    # once tonight (a team's ADD-path restart, and this same restart after a successful
-    # disconnect), leaving OneDrive fully stopped with no indication anything was wrong. Verify it
-    # actually came up and retry rather than trusting a single launch call silently.
+    # The reason a launch could "succeed" and leave OneDrive stopped is fixed at its source now
+    # (see the lpDesktop note in RunAsUser::Start - the process really was being created and then
+    # killed at DLL init). This verify-and-retry stays anyway: it costs nothing on the happy path,
+    # it is the only thing that turned that failure from silent into visible in the first place,
+    # and OneDrive can still legitimately decline to start while it is tearing down a previous
+    # instance. What it must never go back to being is a substitute for an explanation.
     param([int]$MaxAttempts = 5, [int]$CheckDelaySeconds = 5)
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         Write-Log "Restarting OneDrive (attempt $attempt of $MaxAttempts)."
