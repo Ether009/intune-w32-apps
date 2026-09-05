@@ -12,6 +12,35 @@ $CertThumbprint = '5ACD0E673C1D5DA72BB2497C37D74A7F67F7AF25'
 # anything useful under SYSTEM.
 
 #region Resolve every loaded user hive
+function ConvertFrom-EntraSid {
+    # An S-1-12-1-* SID *is* the user's Entra object id in disguise: its four sub-authorities are
+    # the four little-endian uint32 chunks of the object GUID's 16 bytes. No lookup, no network.
+    #
+    # Verified end to end against Graph on a real device: S-1-12-1-1241714020-1091069283-
+    # 3180256690-539406044 derived to 4a030d64-6563-4108-b2dd-8ebddcae2620, which /users/<guid>
+    # resolved to exactly the UPN the OneDrive-registry method produced, and
+    # /users/<guid>/memberOf returned the same 13 unified groups that run's log recorded.
+    #
+    # This matters beyond saving a registry read: the OneDrive-registry method can only identify a
+    # user who has already signed in to OneDrive, so a profile that never has was skipped entirely
+    # and got no auto-mount entries at all. Deriving from the SID means their libraries can be
+    # written before OneDrive's first run rather than after it.
+    #
+    # Only S-1-12-1-* (Entra) can be derived this way. An S-1-5-21-* SID is a domain or local
+    # account whose RID has no relationship to any Entra object, so those still fall back to the
+    # OneDrive account lookup.
+    param([string]$Sid)
+    $parts = $Sid -split '-'
+    if ($Sid -notlike 'S-1-12-1-*' -or $parts.Count -ne 8) { return $null }
+    try {
+        $bytes = New-Object byte[] 16
+        for ($i = 0; $i -lt 4; $i++) {
+            [Array]::Copy([BitConverter]::GetBytes([uint32]$parts[4 + $i]), 0, $bytes, $i * 4, 4)
+        }
+        return ([guid]$bytes).ToString()
+    } catch { return $null }
+}
+
 function Get-LoadedUserContexts {
     # Every user hive currently loaded under HKEY_USERS, not merely "the interactive user". Most of
     # this fleet is shared devices with fast user switching on, so several people are signed in at
@@ -39,9 +68,10 @@ function Get-LoadedUserContexts {
         $profilePath = (Get-ItemProperty -LiteralPath "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid" -ErrorAction SilentlyContinue).ProfileImagePath
         if (-not $profilePath) { continue }
         $contexts += [pscustomobject]@{
-            Sid         = $sid
-            ProfilePath = $profilePath
-            HkuRoot     = "Registry::HKEY_USERS\$sid"
+            Sid           = $sid
+            ProfilePath   = $profilePath
+            HkuRoot       = "Registry::HKEY_USERS\$sid"
+            EntraObjectId = ConvertFrom-EntraSid -Sid $sid
         }
     }
     return $contexts
@@ -188,7 +218,7 @@ function Remove-AutoMountEntry {
 #endregion
 
 #region Graph lookups
-function Get-CurrentUserUpn {
+function Get-UpnFromOneDriveAccount {
     # whoami /upn only reflects the process's own identity (SYSTEM has none) - read it straight
     # out of the target user's own OneDrive account registration instead, matched by tenant ID
     # in case they have multiple OneDrive accounts configured. This is the same technique the
@@ -216,9 +246,12 @@ function Get-CurrentUserTeams {
     # from the group (and its SharePoint site) actually existing - groupTypes -contains 'Unified'
     # is what actually distinguishes an M365 Group (has a SharePoint site) from a plain security
     # group (doesn't), independent of whether it's also been made into a Team.
-    param($Token, $Upn)
+    # $UserId is whichever identifier we have - Graph's /users/{id} accepts the object GUID or the
+    # UPN interchangeably, and the GUID is preferred because it can be derived from the SID without
+    # the user having ever configured OneDrive.
+    param($Token, $UserId)
     $headers = @{ Authorization = "Bearer $Token" }
-    $groups = Invoke-RestMethod -Headers $headers -Uri "https://graph.microsoft.com/v1.0/users/$Upn/memberOf?`$select=id,displayName,groupTypes"
+    $groups = Invoke-RestMethod -Headers $headers -Uri "https://graph.microsoft.com/v1.0/users/$UserId/memberOf?`$select=id,displayName,groupTypes"
     return $groups.value | Where-Object { $_.groupTypes -contains 'Unified' }
 }
 
@@ -268,16 +301,22 @@ try {
         # Per-user try: on a shared device one user's failure (an expired OneDrive account entry,
         # a Graph hiccup on their /memberOf) must not abandon everyone else in the same run.
         try {
-            $upn = Get-CurrentUserUpn
-            if (-not $upn) {
-                # No OneDrive account configured for this tenant in that hive - a profile that has
-                # never signed in to OneDrive, or one belonging elsewhere. Not an error, and not
-                # worth a log line on every run for every such profile.
+            # The Entra object id derived straight from the SID is preferred: it works for a
+            # profile that has never run OneDrive, which the registry lookup cannot see at all.
+            # The registry UPN is still read when present, purely so the log names a person
+            # rather than a GUID; it is also the fallback identifier on a non-Entra SID.
+            $upn = Get-UpnFromOneDriveAccount
+            $userId = if ($UserContext.EntraObjectId) { $UserContext.EntraObjectId } else { $upn }
+            if (-not $userId) {
+                # Neither an Entra SID nor a configured OneDrive account - a local or domain
+                # account with no identity we can resolve. Not an error, and not worth a log line
+                # on every run for every such profile.
                 continue
             }
+            $label = if ($upn) { $upn } else { $userId }
 
-            $teams = @(Get-CurrentUserTeams -Token $token -Upn $upn)
-            Write-Log "User: $upn, Teams: $($teams.Count)"
+            $teams = @(Get-CurrentUserTeams -Token $token -UserId $userId)
+            Write-Log "User: $label, Teams: $($teams.Count)"
 
             # Resolve desired state first - removals have to happen before additions so an entry
             # cleared this run can be rewritten with fresh data below rather than skipped as
@@ -335,7 +374,18 @@ try {
             $usersProcessed++
         }
         catch {
-            Write-Log "ERROR for SID $($UserContext.Sid): $($_.Exception.Message) - continuing with the remaining users."
+            # A 404 here is an ordinary state, not a fault: the profile belongs to someone who has
+            # been removed from the tenant. Now that identity comes from the SID rather than from a
+            # configured OneDrive account, these profiles are reached where they previously were
+            # not, so this would otherwise log a scary ERROR every hour, forever, on any device
+            # holding a leaver's profile.
+            $status = $null
+            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+            if ($status -eq 404) {
+                Write-Log "  Skipping SID $($UserContext.Sid) - no such user in Entra (removed account?)."
+            } else {
+                Write-Log "ERROR for SID $($UserContext.Sid): $($_.Exception.Message) - continuing with the remaining users."
+            }
         }
     }
 
