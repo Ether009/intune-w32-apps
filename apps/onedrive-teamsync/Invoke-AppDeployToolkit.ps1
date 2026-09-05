@@ -16,8 +16,12 @@ anything they don't recognize on sight. This replaces all of it: proper add/remo
 a fully silent add path via OneDrive's own AutoMountTeamSites policy (no window at all), and
 certificate-based app auth. The sync script runs as SYSTEM (that policy's registry path is
 writable only by SYSTEM/Administrators, confirmed via a real ACL check - not even the user it
-acts on behalf of can write it) and resolves the actual interactive user itself to act on their
-behalf, rather than running in their own session.
+acts on behalf of can write it) and resolves users itself rather than running in their session.
+
+It handles every user hive currently loaded under HKEY_USERS in a single run, not just whoever
+is at the keyboard: most of this fleet is shared devices with fast user switching, so several
+people are signed in at once. That is possible because the tool only reads and writes registry
+values - it does not interact with a running OneDrive at all.
 
 This installer also actively removes any leftover copy of the old tool (C:\Scripts\odsetup.ps1
 and its Startup-folder shortcut) from devices that picked it up before it was retired.
@@ -99,14 +103,14 @@ param
 $adtSession = @{
     AppVendor = 'Organization'
     AppName = 'OneDrive Team Sync'
-    AppVersion = '2.4.1'
+    AppVersion = '2.5.0'
     AppArch = 'x64'
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '2.4.1'
+    AppScriptVersion = '2.5.0'
     AppScriptDate = '2026-08-31'
     AppScriptAuthor = ''
     RequireAdmin = $true
@@ -352,6 +356,20 @@ function Uninstall-ADTDeployment
     Remove-Item -Path 'HKLM:\SOFTWARE\Classes\odteamsync' -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
     Get-ChildItem 'Cert:\LocalMachine\My' | Where-Object { $_.Subject -eq $CertSubject } | Remove-Item -Force -ErrorAction SilentlyContinue
+
+    # Machine-wide log and site cache. Also clear the per-user copies these used to live in, on
+    # every profile, so an uninstall doesn't leave a stale OneDriveTeamSync folder behind in each
+    # one - they were per-user until the tool started handling every loaded hive in a single run.
+    Remove-Item -Path 'C:\ProgramData\OneDriveTeamSync' -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        Remove-Item -Path (Join-Path $_.FullName 'AppData\Local\OneDriveTeamSync') -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # NOTE: the TenantAutoMount entries this tool wrote into each user's hive are deliberately left
+    # in place. Removing them would be defensible - nothing maintains that list once the tool is
+    # gone - but an uninstall also happens as half of an Intune supersedence upgrade, and silently
+    # clearing policy for every user on the device during a routine version bump is not a decision
+    # to make implicitly. Left as-is until someone decides it on purpose.
 
 
     ##================================================

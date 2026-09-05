@@ -7,46 +7,55 @@ $CertThumbprint = '5ACD0E673C1D5DA72BB2497C37D74A7F67F7AF25'
 # This script runs as SYSTEM (the AutoMountTeamSites registry path is writable only by
 # SYSTEM/Administrators - a standard user, even the one this script is acting on behalf of,
 # cannot write it - confirmed via a real ACL check on a real device). SYSTEM has no "current
-# user" of its own, so almost everything below has to explicitly resolve and act on the actual
-# interactively logged-on user instead of relying on $env:LOCALAPPDATA / HKCU / whoami, none of
-# which mean anything useful under SYSTEM.
+# user" of its own, so everything below resolves users explicitly and operates on their
+# HKEY_USERS hive rather than relying on $env:LOCALAPPDATA / HKCU / whoami, none of which mean
+# anything useful under SYSTEM.
 
-#region Resolve the interactive user (SYSTEM has none of its own)
-
-function Get-InteractiveUserContext {
-    # explorer.exe only runs in an interactive user's own session, never SYSTEM's or a service
-    # session - its owner and session ID reliably identify "the person actually sitting here."
-    # Returns $null rather than throwing when nobody is signed in: the hourly trigger fires
-    # regardless of sessions, so "no interactive user" is a normal outcome, not an error.
-    $proc = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
-    if (-not $proc) { return $null }
-    $ownerSid = (Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid).Sid
-
-    $profilePath = (Get-ItemProperty -LiteralPath "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$ownerSid").ProfileImagePath
-
-    return [pscustomobject]@{
-        Sid           = $ownerSid
-        SessionId     = [uint32]$proc.SessionId
-        ProfilePath   = $profilePath
-        LocalAppData  = Join-Path $profilePath 'AppData\Local'
-        HkuRoot       = "Registry::HKEY_USERS\$ownerSid"
+#region Resolve every loaded user hive
+function Get-LoadedUserContexts {
+    # Every user hive currently loaded under HKEY_USERS, not merely "the interactive user". Most of
+    # this fleet is shared devices with fast user switching on, so several people are signed in at
+    # once; the previous explorer.exe-owner approach silently picked whichever one happened to be
+    # first and nobody else was ever synced.
+    #
+    # This is only safe now that nothing touches a running OneDrive: the entire job is reading and
+    # writing registry values under a user's own hive, which needs no session, no desktop, no
+    # window station and no token.
+    #
+    # Deliberately does NOT load signed-off profiles from NTUSER.DAT. A hive that fails to unload
+    # stays mounted, which blocks profile deletion and can wedge the User Profile Service at
+    # sign-in - comfortably the riskiest thing this tool could do. A signed-off user gets their
+    # entries fixed by the logon trigger the moment they sign in, so hive-loading would only make
+    # that happen somewhat earlier, which is not worth that failure mode.
+    $contexts = @()
+    foreach ($key in (Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue)) {
+        $sid = $key.PSChildName
+        # Real user accounts only. S-1-12-1-* is what Entra-joined sign-ins actually get - verified
+        # by enumerating HKEY_USERS on a real device, where the signed-in user appeared as
+        # S-1-12-1-... and not the S-1-5-21-... form an AD-joined machine would use. The end anchor
+        # also excludes the "<sid>_Classes" companion hive, and neither pattern matches .DEFAULT or
+        # the S-1-5-18/19/20 service accounts.
+        if ($sid -notmatch '^S-1-(12-1|5-21)-[\d-]+$') { continue }
+        $profilePath = (Get-ItemProperty -LiteralPath "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid" -ErrorAction SilentlyContinue).ProfileImagePath
+        if (-not $profilePath) { continue }
+        $contexts += [pscustomobject]@{
+            Sid         = $sid
+            ProfilePath = $profilePath
+            HkuRoot     = "Registry::HKEY_USERS\$sid"
+        }
     }
+    return $contexts
 }
-
 #endregion
 
-$UserContext = Get-InteractiveUserContext
-if (-not $UserContext) {
-    # Nobody signed in. There is no user whose libraries could be synced, and no per-user profile
-    # to even write a log into, so there is nothing useful to record. Exit 0 rather than failing:
-    # the hourly trigger runs whether or not anyone is logged on, and an overnight machine would
-    # otherwise fill Task Scheduler history with failures that mean nothing.
-    exit 0
-}
-$LogDir = Join-Path $UserContext.LocalAppData 'OneDriveTeamSync'
-$LogFile = Join-Path $LogDir 'sync.log'
-$SiteCacheFile = Join-Path $LogDir 'sitecache.json'
-New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+# Machine-wide rather than per-user, now that one run covers several users: a single log to read
+# when supporting a shared device, and - more useful - a single site cache. A group's site and list
+# ids are tenant-global rather than per-user, so everyone in overlapping groups on the same device
+# shares the lookups instead of each paying for them.
+$StateDir = 'C:\ProgramData\OneDriveTeamSync'
+$LogFile = Join-Path $StateDir 'sync.log'
+$SiteCacheFile = Join-Path $StateDir 'sitecache.json'
+New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
 
 function Write-Log {
     param([string]$Message)
@@ -129,8 +138,6 @@ function Save-SiteCache { param($Cache) Write-JsonHashtable -Path $SiteCacheFile
 
 #endregion
 
-#endregion
-
 #region OneDrive AutoMountTeamSites policy state - silent add mechanism
 # Verified directly against the real OneDrive.admx on this machine (not documentation alone):
 #   policy AutoMountTeamSites -> list key "Software\Policies\Microsoft\OneDrive\TenantAutoMount",
@@ -187,15 +194,18 @@ function Get-CurrentUserUpn {
     # in case they have multiple OneDrive accounts configured. This is the same technique the
     # old tool used, which was actually the right call for a SYSTEM-context script - it just
     # wasn't SYSTEM-context before.
+    # Returns $null rather than throwing when this hive has no account for our tenant. With every
+    # loaded hive now being walked, "this profile has never signed in to OneDrive" is an ordinary
+    # thing to encounter (a local admin account, a profile from another tenant), not a failure.
     $accountsPath = "$($UserContext.HkuRoot)\Software\Microsoft\OneDrive\Accounts"
-    if (-not (Test-Path $accountsPath)) { throw "No OneDrive accounts found under the user's hive." }
-    foreach ($account in Get-ChildItem $accountsPath) {
+    if (-not (Test-Path $accountsPath)) { return $null }
+    foreach ($account in Get-ChildItem $accountsPath -ErrorAction SilentlyContinue) {
         $props = Get-ItemProperty $account.PSPath -ErrorAction SilentlyContinue
         if ($props.ConfiguredTenantId -eq $TenantId -and $props.UserEmail) {
             return $props.UserEmail
         }
     }
-    throw "No OneDrive account configured for tenant $TenantId under the user's hive."
+    return $null
 }
 
 function Get-CurrentUserTeams {
@@ -233,99 +243,116 @@ function Get-TeamSiteInfo {
 
 #endregion
 
-#endregion
-
 #region Main sync pass
+$contexts = @(Get-LoadedUserContexts)
+if ($contexts.Count -eq 0) {
+    # No user hives loaded at all - nobody has signed in since boot. The hourly trigger fires
+    # whether or not anyone is logged on, so this is an ordinary outcome rather than a failure,
+    # and there is nothing worth writing a log line about.
+    exit 0
+}
+
 try {
-    Write-Log "=== Sync run starting ==="
+    Write-Log "=== Sync run starting ($($contexts.Count) loaded profile(s)) ==="
+
+    # One app-only token covers every user in this run: it is the application's identity, not
+    # theirs, so it does not need re-requesting per user. Same for the site cache - a group's site
+    # and list ids are tenant-global, so users in overlapping groups share the lookups.
     $token = Get-GraphToken
-    $upn = Get-CurrentUserUpn
-    $teams = @(Get-CurrentUserTeams -Token $token -Upn $upn)
-    Write-Log "User: $upn, Teams: $($teams.Count)"
-
-    $autoMounted = @(Get-AutoMountEntries)
-
-    # Resolve desired state first - removals have to happen before additions so an entry cleared
-    # this run can be rewritten with fresh data below rather than skipped as "already present".
-    # Site/list ids come from the local cache where possible: they're fixed for the life of the
-    # group, so re-fetching them every run was two Graph calls per group for data that never
-    # changed. Only groups the cache hasn't seen cost anything now.
     $siteCache = Get-SiteCache
     $cacheChanged = $false
-    $desired = @{}
-    foreach ($team in $teams) {
-        $cached = $siteCache[$team.id]
-        if ($cached -and $cached.SiteId -and $cached.WebId -and $cached.ListId -and $cached.WebUrl) {
-            $info = [pscustomobject]@{ SiteId = $cached.SiteId; WebId = $cached.WebId; ListId = $cached.ListId; WebUrl = $cached.WebUrl }
-        } else {
-            $info = Get-TeamSiteInfo -Token $token -GroupId $team.id
-            if ($info) {
-                $siteCache[$team.id] = @{ SiteId = $info.SiteId; WebId = $info.WebId; ListId = $info.ListId; WebUrl = $info.WebUrl; cachedAt = (Get-Date -Format 'o') }
-                $cacheChanged = $true
+    $groupsSeen = @{}
+    $usersProcessed = 0
+
+    foreach ($UserContext in $contexts) {
+        # Per-user try: on a shared device one user's failure (an expired OneDrive account entry,
+        # a Graph hiccup on their /memberOf) must not abandon everyone else in the same run.
+        try {
+            $upn = Get-CurrentUserUpn
+            if (-not $upn) {
+                # No OneDrive account configured for this tenant in that hive - a profile that has
+                # never signed in to OneDrive, or one belonging elsewhere. Not an error, and not
+                # worth a log line on every run for every such profile.
+                continue
             }
+
+            $teams = @(Get-CurrentUserTeams -Token $token -Upn $upn)
+            Write-Log "User: $upn, Teams: $($teams.Count)"
+
+            # Resolve desired state first - removals have to happen before additions so an entry
+            # cleared this run can be rewritten with fresh data below rather than skipped as
+            # "already present". Site/list ids come from the shared cache where possible: they are
+            # fixed for the life of the group, so re-fetching them every run was two Graph calls
+            # per group for data that never changed.
+            $desired = @{}
+            foreach ($team in $teams) {
+                $groupsSeen[$team.id] = $true
+                $cached = $siteCache[$team.id]
+                if ($cached -and $cached.SiteId -and $cached.WebId -and $cached.ListId -and $cached.WebUrl) {
+                    $info = [pscustomobject]@{ SiteId = $cached.SiteId; WebId = $cached.WebId; ListId = $cached.ListId; WebUrl = $cached.WebUrl }
+                } else {
+                    $info = Get-TeamSiteInfo -Token $token -GroupId $team.id
+                    if ($info) {
+                        $siteCache[$team.id] = @{ SiteId = $info.SiteId; WebId = $info.WebId; ListId = $info.ListId; WebUrl = $info.WebUrl; cachedAt = (Get-Date -Format 'o') }
+                        $cacheChanged = $true
+                    }
+                }
+                if (-not $info) { Write-Log "  Skipping $($team.displayName) - no document library found"; continue }
+                $desired[$info.SiteId] = [pscustomobject]@{ Info = $info; DisplayName = $team.displayName }
+            }
+
+            # Removals: auto-mount entries this tool previously wrote for sites the user is no
+            # longer a member of. Removing the entry is the entire removal story - it is what stops
+            # OneDrive being told, every single run, to mount a library the user has lost access to
+            # (it retried forever, the error never cleared, and sign-in got measurably slower for
+            # each stale library). Nothing is done about the local sync itself: the user removes
+            # that themselves, prompted by OneDrive's own "can't sync" error. See git history
+            # around v2.2.x for the removed local-disconnect implementation.
+            #
+            # Only ever touches entries the tool itself created, so it cannot affect the user's
+            # personal OneDrive or a library they synced by hand.
+            foreach ($entry in @(Get-AutoMountEntries)) {
+                if ($desired.ContainsKey($entry.SiteId)) { continue }
+                Remove-AutoMountEntry -SiteId $entry.SiteId
+            }
+
+            # Additions. Auto-mount state is re-read because the removals above may have cleared an
+            # entry we are about to recreate with fresh data.
+            #
+            # Nothing is done to make OneDrive notice sooner: it re-reads the auto-mount list on its
+            # own schedule and picks new entries up within a few hours, confirmed on a real device.
+            # Writing the entry is the whole job. An earlier version also zeroed OneDrive's
+            # TimerAutoMount cooldown to force an immediate check - that write silently never took
+            # effect from SYSTEM, and since the library mounts on its own anyway, it was dropped
+            # rather than fixed. Adds only have to converge eventually, not promptly.
+            $autoMounted = @(Get-AutoMountEntries)
+            foreach ($siteId in $desired.Keys) {
+                $info = $desired[$siteId].Info
+                if ($autoMounted | Where-Object { $_.SiteId -eq $siteId }) { continue }
+                Set-AutoMountEntry -SiteId $info.SiteId -WebId $info.WebId -ListId $info.ListId -WebUrl $info.WebUrl -DisplayName $desired[$siteId].DisplayName
+            }
+
+            $usersProcessed++
         }
-        if (-not $info) { Write-Log "Skipping $($team.displayName) - no document library found"; continue }
-        $desired[$info.SiteId] = [pscustomobject]@{ Info = $info; DisplayName = $team.displayName }
+        catch {
+            Write-Log "ERROR for SID $($UserContext.Sid): $($_.Exception.Message) - continuing with the remaining users."
+        }
     }
 
-    # Drop cache entries for groups the user is no longer in, so the file doesn't grow forever and
-    # a rejoin re-resolves against Graph rather than trusting arbitrarily old ids.
-    $currentGroupIds = @{}
-    foreach ($team in $teams) { $currentGroupIds[$team.id] = $true }
-    foreach ($cachedId in @($siteCache.Keys)) {
-        if (-not $currentGroupIds.ContainsKey($cachedId)) { $siteCache.Remove($cachedId); $cacheChanged = $true }
+    # Drop cache entries for groups nobody on this device is in any more, so the file doesn't grow
+    # forever and a rejoin re-resolves against Graph rather than trusting arbitrarily old ids.
+    # Pruned against the union across all users, not per user - on a shared device one user's
+    # groups are not the whole picture, and pruning per user would make them fight over the cache.
+    # Skipped entirely if no user was processed successfully, so a total Graph outage empties the
+    # cache instead of a run that simply had nothing to say.
+    if ($usersProcessed -gt 0) {
+        foreach ($cachedId in @($siteCache.Keys)) {
+            if (-not $groupsSeen.ContainsKey($cachedId)) { $siteCache.Remove($cachedId); $cacheChanged = $true }
+        }
     }
     if ($cacheChanged) { Save-SiteCache -Cache $siteCache }
 
-    #region Removals
-    # Auto-mount entries this tool previously wrote for sites the user is no longer a member of.
-    # Removing the entry is the entire removal story now, and it is the part that actually matters:
-    # the entry was being rewritten every run, so OneDrive kept being told to mount a library the
-    # user had lost access to. It retried forever, the error never cleared, and sign-in got
-    # measurably slower for every stale library - confirmed on a real device.
-    #
-    # What this deliberately no longer does is act on the local sync: no stopping OneDrive, no
-    # unregistering the sync root, no deleting local folders, no notification. That machinery was
-    # proven to work, but it could only ever run while OneDrive was stopped, so it depended on
-    # either a toast button (which never renders at all from a process like this one) or on the
-    # user happening to quit OneDrive during the few minutes a run was watching. Both were too
-    # unreliable to build on. The user disconnects the stale library themselves, prompted by
-    # OneDrive's own "can't sync" error; this just stops fighting them about it. The removed
-    # implementation is in git history around v2.2.x if it is ever wanted back.
-    #
-    # No site-path matching is needed here (unlike the additions side): $autoMounted entries carry
-    # the real SiteId this tool wrote, so they are matched against $desired directly. And because
-    # this only ever touches entries the tool itself created, it cannot affect the user's personal
-    # OneDrive or a private channel they synced by hand.
-    foreach ($entry in $autoMounted) {
-        if ($desired.ContainsKey($entry.SiteId)) { continue }
-        Remove-AutoMountEntry -SiteId $entry.SiteId
-    }
-
-    #endregion
-
-    #region Additions
-    # Re-read auto-mount state in case the removals pass above cleared an entry we're about to
-    # recreate below with fresh data.
-    #
-    # Nothing is done to make OneDrive notice sooner: it re-reads the auto-mount list on its own
-    # schedule and picks new entries up within a few hours, confirmed on a real device. Writing the
-    # entry is the whole job here. An earlier version also zeroed OneDrive's TimerAutoMount cooldown
-    # to force an immediate check - that write silently never took effect from SYSTEM, and since the
-    # library mounts on its own anyway and the latency doesn't matter, it was dropped rather than
-    # fixed. Adds only have to converge eventually, not promptly - some users go a year without a
-    # reboot, which is why this runs hourly rather than only at logon.
-    $autoMounted = @(Get-AutoMountEntries)
-    foreach ($siteId in $desired.Keys) {
-        $info = $desired[$siteId].Info
-        $existing = $autoMounted | Where-Object { $_.SiteId -eq $siteId }
-        if ($existing) { continue }
-        Set-AutoMountEntry -SiteId $info.SiteId -WebId $info.WebId -ListId $info.ListId -WebUrl $info.WebUrl -DisplayName $desired[$siteId].DisplayName
-    }
-
-    #endregion
-
-    Write-Log "=== Sync run complete ==="
+    Write-Log "=== Sync run complete ($usersProcessed user(s) processed) ==="
 }
 catch {
     Write-Log "ERROR: $($_.Exception.Message)"
