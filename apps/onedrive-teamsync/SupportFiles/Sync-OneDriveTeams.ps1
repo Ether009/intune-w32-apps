@@ -374,18 +374,11 @@ try {
             $usersProcessed++
         }
         catch {
-            # A 404 here is an ordinary state, not a fault: the profile belongs to someone who has
-            # been removed from the tenant. Now that identity comes from the SID rather than from a
-            # configured OneDrive account, these profiles are reached where they previously were
-            # not, so this would otherwise log a scary ERROR every hour, forever, on any device
-            # holding a leaver's profile.
-            $status = $null
-            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
-            if ($status -eq 404) {
-                Write-Log "  Skipping SID $($UserContext.Sid) - no such user in Entra (removed account?)."
-            } else {
-                Write-Log "ERROR for SID $($UserContext.Sid): $($_.Exception.Message) - continuing with the remaining users."
-            }
+            # Covers a deleted user (Graph 404) as well as anything else that goes wrong for one
+            # person. No special case for the 404: a profile belonging to someone removed from the
+            # tenant is nothing this tool needs to do anything about, and logging it as an error
+            # every run is fine - nobody is coming back to fix a leaver's auto-mount entries.
+            Write-Log "ERROR for SID $($UserContext.Sid): $($_.Exception.Message) - continuing with the remaining users."
         }
     }
 
