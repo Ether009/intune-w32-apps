@@ -96,15 +96,15 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Lunds Fontänhus'
     AppName = 'Desktop Shortcut Deployment'
-    AppVersion = '1.1.3'
+    AppVersion = '1.2.0'
     AppArch = ''
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.1.3'
-    AppScriptDate = '2026-07-23'
+    AppScriptVersion = '1.2.0'
+    AppScriptDate = '2026-09-08'
     AppScriptAuthor = ''
     RequireAdmin = $true
 
