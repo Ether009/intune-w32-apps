@@ -1,5 +1,12 @@
 [
   {
+    "Name": "Lunds Fontänhus",
+    "Type": "Local",
+    "Target": "C:\\Windows\\explorer.exe",
+    "Arguments": "%USERPROFILE%\\Lunds Fontänhus\\",
+    "WorkingDirectory": "C:\\Users\\"
+  },
+  {
     "Name": "Lunds Fontänhus Hemsida",
     "Type": "Url",
     "Target": "https://lundsfontanhus.se",
