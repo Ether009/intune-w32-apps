@@ -11,10 +11,11 @@
     and for each remaining profile decides whether to delete it based on LastUseTime
     versus RetentionDays from the JSON config - unless the profile is protected:
 
-      - One of the ProtectedRecentUsers (default 2) most recently used profiles. This
-        is also what protects whoever is signed in right now: LastUseTime keeps
-        advancing throughout an active session, so an active user always sorts first.
-        No separate "is anyone logged on" check is therefore needed.
+      - In use right now: the account owns a live interactive session, or its registry
+        hive is loaded. This is a hard guard read straight from the session list, and
+        it is checked before any timestamp is considered, so it holds even if every
+        last-used signal is wrong.
+      - One of the ProtectedRecentUsers (default 2) most recently used profiles.
       - Listed by SID or account name in the config's exclusion lists.
 
     Everyone outside that set can be acted on forcefully when needed - signed out
@@ -1354,7 +1355,14 @@ function Get-ProfileUnloadTime {
     }
     if ($null -eq $props.LocalProfileUnloadTimeHigh -or $null -eq $props.LocalProfileUnloadTimeLow) { return $null }
     try {
-        $fileTime = ([int64]$props.LocalProfileUnloadTimeHigh -shl 32) -bor ([int64]$props.LocalProfileUnloadTimeLow -band 0xFFFFFFFF)
+        # The mask MUST be 0xFFFFFFFFL (Int64). A bare 0xFFFFFFFF is parsed by
+        # PowerShell as Int32 -1, so "-band 0xFFFFFFFF" is a no-op that preserves the
+        # sign extension instead of clearing it. Both halves are REG_DWORDs read back
+        # as signed Int32, so whenever the low half has its high bit set (~52% of
+        # timestamps) the old mask produced a negative fileTime, the "-le 0" guard
+        # below discarded it, and this function silently returned $null - throwing away
+        # the only trustworthy record of when the user last finished using the device.
+        $fileTime = ([int64]$props.LocalProfileUnloadTimeHigh -shl 32) -bor ([int64]$props.LocalProfileUnloadTimeLow -band 0xFFFFFFFFL)
         if ($fileTime -le 0) { return $null }
         return [DateTime]::FromFileTime($fileTime)
     } catch {
@@ -1682,8 +1690,9 @@ function Get-ProfileKeepReason {
     <#
     .SYNOPSIS
         Determines why a profile should be kept (protected from deletion), if any.
-        Checked in order: most-recently-used, Intune primary user, excluded by SID,
-        excluded by username, undeterminable age, or not yet past RetentionDays.
+        Checked in order: in use right now (live session or loaded hive),
+        most-recently-used, excluded by SID, excluded by username, undeterminable age,
+        or not yet past RetentionDays.
     .PARAMETER Profile
         The Win32_UserProfile CIM instance.
     .PARAMETER Sid
@@ -1696,6 +1705,8 @@ function Get-ProfileKeepReason {
         The effective config.
     .PARAMETER AgeDays
         The profile's age in days (see Get-ProfileAgeInfo).
+    .PARAMETER Sessions
+        The session list from Get-InteractiveSessions, for the in-use guard.
     .OUTPUTS
         The keep-reason string, or $null if the profile is a genuine deletion candidate.
     #>
@@ -1705,10 +1716,26 @@ function Get-ProfileKeepReason {
         [String]$AccountName,
         [String[]]$RecentSids = @(),
         [Parameter(Mandatory)][Object]$Config,
-        $AgeDays
+        $AgeDays,
+        [Object[]]$Sessions = @()
     )
-    # Recency also covers whoever is signed in: a live session resolves to "now", so it
-    # always sorts first. A loaded hive on its own is not a protection.
+    # Hard in-use guard, evaluated before anything else and independent of every
+    # computed timestamp: a profile with a live session or a loaded hive is being used
+    # right now, so it can never be a deletion candidate no matter what its age
+    # resolves to.
+    #
+    # This used to be left implicit in the recency ranking ("a live session resolves to
+    # 'now', so it always sorts first"), which made the protection only as good as the
+    # last-used signals feeding that ranking. Any bug that corrupted those signals - as
+    # the unload-time mask in Get-ProfileUnloadTime did - could therefore cost a live
+    # user their protection slot and make an in-use profile deletable. A guard that
+    # reads the session list directly cannot fail that way.
+    if (Test-SidHasInteractiveSession -Sid $Sid -Sessions $Sessions) {
+        return 'the account is signed in on this device right now'
+    }
+    if ($Profile.Loaded) {
+        return 'the profile registry hive is currently loaded (the profile is in use)'
+    }
     $rank = Get-RecentUseRank -Sid $Sid -RecentSids $RecentSids
     if ($rank -gt 0) {
         return "$(Get-RecentUseRankLabel -Rank $rank) profile on this device"
@@ -2634,7 +2661,7 @@ function Invoke-ProfileEvaluation {
     $lastUsed = Get-ProfileLastUsed -Profile $Profile -Sessions $Sessions -Now $Now -ActivityPaths $Config.ActivityPaths
     $ageInfo = Get-ProfileAgeInfo -LastUsed $lastUsed.LastUsed -Source $lastUsed.Source -Now $Now
     $sizeInfo = Get-ProfileSizeInfo -LocalPath $Profile.LocalPath -IncludeProfileSize $Config.IncludeProfileSize -TopFolderCount $Config.TopFolderCount -TopFolderMinMB $Config.TopFolderMinMB -AdditionalDehydrateFolders $Config.AdditionalDehydrateFolders
-    $keepReason = Get-ProfileKeepReason -Profile $Profile -Sid $sid -AccountName $identity.AccountName -RecentSids $RecentSids -Config $Config -AgeDays $ageInfo.AgeDays
+    $keepReason = Get-ProfileKeepReason -Profile $Profile -Sid $sid -AccountName $identity.AccountName -RecentSids $RecentSids -Config $Config -AgeDays $ageInfo.AgeDays -Sessions $Sessions
     # Decided after the keep/delete verdict, because dehydration follows it: the
     # profiles worth reclaiming from are the ones staying, not the ones going.
     $dehydrationEligible = Test-DehydrationEligible -Config $Config -IsKept ([bool]$keepReason) -HasSession (Test-SidHasInteractiveSession -Sid $Profile.SID -Sessions $Sessions)
@@ -2702,7 +2729,15 @@ function Resolve-DownloadsPurgeSids {
             Write-CleanupLog -Severity Warning -Message "Could not resolve Downloads-purge target '$upn' to a local SID on this device (never signed in here?) - falling back to DownloadsPurgeUsernames matching only for this entry."
         }
     }
-    return $sids
+    # ",$sids" is required: a bare "return $sids" is enumerated by the pipeline, which
+    # destroys the HashSet. With nothing resolved it collapses to $null, and binding
+    # that to Invoke-ProfileEvaluation's Mandatory -DownloadsPurgeSids threw "Cannot
+    # bind argument ... because it is null" on the very first profile - killing every
+    # run before a single profile was evaluated, with no log line and no notification.
+    # A single resolved SID was just as wrong: it collapsed to a bare [string], whose
+    # .Contains() does substring matching, so Test-DownloadsPurgeTarget would match any
+    # SID that happened to be a substring of it.
+    return ,$sids
 }
 
 function Get-NonSpecialUserProfiles {
@@ -3044,7 +3079,20 @@ $errors = 0
 $notifyDetails = @()
 
 foreach ($profile in $allProfiles) {
-    $evaluation = Invoke-ProfileEvaluation -Profile $profile -Config $config -Now $now -DeviceName $deviceName -RecentSids $recentSids -DownloadsPurgeSids $downloadsPurgeSids -Sessions $interactiveSessions
+    # Per-profile try/catch: with $ErrorActionPreference = 'Stop' and no handler here, a
+    # single unexpected error anywhere inside the evaluation terminated the whole script
+    # silently - no Error line (the throw never reached Write-CleanupLog), no Summary,
+    # and no webhook notification, because both of those come after this loop. Runs then
+    # looked identical to a machine that simply had nothing to do. One profile failing
+    # must cost that profile only, and it must be loud.
+    try {
+        $evaluation = Invoke-ProfileEvaluation -Profile $profile -Config $config -Now $now -DeviceName $deviceName -RecentSids $recentSids -DownloadsPurgeSids $downloadsPurgeSids -Sessions $interactiveSessions
+    } catch {
+        $errors++
+        $failedLabel = if ($profile.LocalPath) { $profile.LocalPath } else { $profile.SID }
+        Write-CleanupLog -Severity Error -Message "Evaluation of '$failedLabel' failed and was skipped: $_ | at $($_.InvocationInfo.PositionMessage -replace '\s+', ' ')"
+        continue
+    }
 
     if ($evaluation.Kept) { $kept++ }
     if ($evaluation.Candidate) { $candidates++ }
