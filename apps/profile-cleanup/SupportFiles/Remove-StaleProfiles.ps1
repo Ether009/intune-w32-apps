@@ -28,9 +28,12 @@
     "Delete Account" UI does it; the escalation above only runs if that first attempt
     fails.
 
-    If LogOnly is true in the config (the shipped default), every deletion decision is
-    logged as "Would delete" but nothing is actually removed - flip it to false once
-    the logged candidates have been reviewed across the fleet.
+    LogOnly (true in the shipped default) is a master switch over EVERY action this
+    script can take, not just the deletion: no profile is removed, no Downloads folder
+    is emptied, no browser cache is cleared, no OneDrive content is dehydrated, no
+    known folder is redirected, and nobody is ever forcibly signed out. A LogOnly run
+    is read-only apart from its own log file - it reports what it would have done, so
+    the decisions can be reviewed across the fleet before flipping it to false.
 
     Optionally (Dehydrate, off by default - prototype), a stale profile that ends up
     NOT deleted this run for any reason - kept/protected, a LogOnly candidate, or a
@@ -42,10 +45,11 @@
     Independent of all of the above, every run also handles each profile's Downloads
     folder one of two ways:
       - For the small, explicitly configured set of shared/generic accounts in
-        DownloadsPurgeUsernames/DownloadsPurgeUpns, Downloads is unconditionally
-        emptied every run regardless of staleness/LogOnly - see Clear-DownloadsFolder.
-        If a file is locked because that account happens to be logged on, the session
-        is force-logged-off (Invoke-ForceLogoff) and deletion is retried.
+        DownloadsPurgeUsernames/DownloadsPurgeUpns, Downloads is emptied every run
+        regardless of staleness (but not regardless of LogOnly) - see
+        Clear-DownloadsFolder. If a file is locked because that account happens to be
+        logged on, the session is force-logged-off (Invoke-ForceLogoff) and deletion is
+        retried.
       - For every other profile (when ScanDownloads is on, the default), Downloads is
         scanned read-only for filename/size/last-accessed/last-written per file, and
         the result is currently discarded - see Get-DownloadsInventory.
@@ -1079,9 +1083,10 @@ function Remove-DownloadsItems {
 function Clear-DownloadsFolder {
     <#
     .SYNOPSIS
-        Unconditionally empties a profile's Downloads folder (files and subfolders),
-        every run, regardless of RetentionDays/LogOnly/staleness - intended only for
-        the configured set of Downloads-purge target accounts. If deletion fails
+        Empties a profile's Downloads folder (files and subfolders) every run,
+        regardless of RetentionDays/staleness - intended only for the configured set of
+        Downloads-purge target accounts. LogOnly suppresses it entirely; the caller
+        (Invoke-DownloadsHandling) inventories and reports instead. If deletion fails
         because a file is locked and the profile is loaded, force-logs-off that
         session (Invoke-ForceLogoff) and retries the failed items once.
     .PARAMETER Profile
@@ -1663,6 +1668,9 @@ function Invoke-DownloadsHandling {
         The session list from Get-InteractiveSessions, for the locked-file logoff path.
     .PARAMETER IsUntouchable
         Whether this profile is the last or primary user (suppresses force-logoff only).
+    .PARAMETER LogOnly
+        LogOnly from the config. When set, a purge target is inventoried and reported
+        but nothing is deleted and nobody is signed out.
     .OUTPUTS
         [pscustomobject] { Detail (string, empty unless IsPurgeTarget);
         FreedBytes (space actually released) }
@@ -1673,9 +1681,27 @@ function Invoke-DownloadsHandling {
         [Parameter(Mandatory)][Bool]$IsPurgeTarget,
         [Parameter(Mandatory)][Bool]$ScanDownloads,
         [Object[]]$Sessions = @(),
-        [Bool]$IsUntouchable = $false
+        [Bool]$IsUntouchable = $false,
+        [Bool]$LogOnly = $false
     )
     if ($IsPurgeTarget) {
+        # LogOnly suppresses the purge like every other action - see
+        # Test-DehydrationEligible. This one matters most: Clear-DownloadsFolder deletes
+        # a user's files outright and will force-log-off their session to unlock any it
+        # cannot delete, so a "log only" run had the loudest possible side effect.
+        if ($LogOnly) {
+            # Assigned in two statements, not as "$inventory = if (...) { @() }": an if
+            # used as an expression has its output enumerated, so an empty result
+            # collapses to $null and $inventory.Count then renders as blank - the same
+            # unrolling trap that made Resolve-DownloadsPurgeSids return $null.
+            $inventory = @()
+            if ($Profile.LocalPath) { $inventory = @(Get-DownloadsInventory -ProfilePath $Profile.LocalPath) }
+            $bytes = ($inventory | Measure-Object -Property SizeBytes -Sum).Sum
+            if (-not $bytes) { $bytes = [int64]0 }
+            $detail = "would purge Downloads: $($inventory.Count) item(s), $(Format-FolderSize -Bytes $bytes). LogOnly is enabled - no action taken."
+            Write-CleanupLog -Message "Downloads purge target '$Label': $detail"
+            return [pscustomobject]@{ Detail = $detail; FreedBytes = [int64]0 }
+        }
         $purge = Clear-DownloadsFolder -Profile $Profile -Label $Label -Sessions $Sessions -IsUntouchable $IsUntouchable
         return [pscustomobject]@{ Detail = $purge.Detail; FreedBytes = $purge.BytesDeleted }
     }
@@ -1966,9 +1992,8 @@ function Invoke-ProfileBrowserCacheCleanup {
         the account - not on staleness, because the caches worth clearing belong to
         the accounts in daily use, which are the ones staleness protects.
 
-        Runs regardless of LogOnly, in the same way dehydration does: a browser cache
-        is disposable by design and is rebuilt on next use, so this costs the user
-        nothing beyond a slower first page load.
+        Suppressed by LogOnly, like every other action. The caches are still measured
+        so the report carries the size of the opportunity.
 
         The age signal is saved before and restored after, so cleaning cannot make a
         profile look freshly used.
@@ -2000,11 +2025,15 @@ function Invoke-ProfileBrowserCacheCleanup {
     $folders = @(Get-BrowserCacheFolders -ProfilePath $Profile.LocalPath -Patterns $Config.BrowserCachePaths)
     if ($folders.Count -eq 0) { return $result }
 
+    # LogOnly suppresses this like every other action - see Test-DehydrationEligible.
+    # The measurement below still runs, so a LogOnly run reports the full size of the
+    # opportunity without touching a byte.
     $signedIn = Test-SidHasInteractiveSession -Sid $Profile.SID -Sessions $Sessions
-    if (-not $Config.ClearBrowserCaches -or $signedIn) {
+    if (-not $Config.ClearBrowserCaches -or $signedIn -or $Config.LogOnly) {
         foreach ($folder in $folders) { $result.FreeableBytes += Get-ItemSizeBytes -Item $folder }
-        if ($signedIn -and $Config.ClearBrowserCaches) {
-            $result.Detail = "skipped browser cache cleanup: the account is signed in ($(Format-FolderSize -Bytes $result.FreeableBytes) could be freed)"
+        if ($Config.ClearBrowserCaches) {
+            $reason = if ($signedIn) { 'the account is signed in' } else { 'LogOnly is enabled' }
+            $result.Detail = "skipped browser cache cleanup: $reason ($(Format-FolderSize -Bytes $result.FreeableBytes) could be freed)"
         }
         return $result
     }
@@ -2371,6 +2400,12 @@ function Invoke-ProfileFolderRedirection {
     if (Test-SidHasInteractiveSession -Sid $Profile.SID -Sessions $Sessions) {
         return 'skipped folder redirection: the account is signed in'
     }
+    # Checked before the hive mount below, not just handed to Invoke-KnownFolderRedirect
+    # as -WhatIfOnly: loading a registry hive is itself an action, and under LogOnly this
+    # script must leave nothing but its own log file behind.
+    if ($Config.LogOnly) {
+        return "would redirect $($folders -join ', ') into OneDrive. LogOnly is enabled - no action taken."
+    }
 
     $hive = Mount-UserProfileHive -Sid $Profile.SID -LocalPath $Profile.LocalPath
     if ($null -eq $hive) { return 'skipped folder redirection: could not read the account settings' }
@@ -2454,6 +2489,12 @@ function Test-DehydrationEligible {
         [Parameter(Mandatory)][Bool]$IsKept,
         [Parameter(Mandatory)][Bool]$HasSession
     )
+    # LogOnly is a master switch over every action this script can take, dehydration
+    # included. It used to gate only the deletion, so a "log only" run still evicted
+    # local copies of OneDrive files, cleared browser caches and emptied Downloads for
+    # purge targets - which made LogOnly useless as a containment measure, exactly when
+    # containment is what it is reached for.
+    if ($Config.LogOnly) { return $false }
     return ($Config.Dehydrate -and $IsKept -and -not $HasSession)
 }
 
@@ -2649,7 +2690,7 @@ function Invoke-ProfileEvaluation {
     $isUntouchable = Test-ProfileIsUntouchable -Sid $sid -RecentSids $RecentSids -IsExcluded $isExcluded
 
     $isDownloadsPurgeTarget = Test-DownloadsPurgeTarget -Sid $sid -Label $label -PurgeSids $DownloadsPurgeSids -PurgeUsernames $Config.DownloadsPurgeUsernames
-    $downloads = Invoke-DownloadsHandling -Profile $Profile -Label $label -IsPurgeTarget $isDownloadsPurgeTarget -ScanDownloads $Config.ScanDownloads -Sessions $Sessions -IsUntouchable $isUntouchable
+    $downloads = Invoke-DownloadsHandling -Profile $Profile -Label $label -IsPurgeTarget $isDownloadsPurgeTarget -ScanDownloads $Config.ScanDownloads -Sessions $Sessions -IsUntouchable $isUntouchable -LogOnly $Config.LogOnly
     $downloadsPurgeDetail = $downloads.Detail
     $downloadsFreedMB = [Math]::Round($downloads.FreedBytes / 1MB, 1)
 
