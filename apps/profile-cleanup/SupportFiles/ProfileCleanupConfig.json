@@ -1,7 +1,7 @@
 ﻿{
-  "Version": "1.25.8",
+  "Version": "1.26.0",
   "RetentionDays": 30,
-  "LogOnly": false,
+  "LogOnly": true,
   "ProtectedRecentUsers": 2,
   "ExcludedSids": [],
   "ExcludedUsernames": ["IntelTelemetryAgent", "WsiAccount"],
@@ -15,8 +15,8 @@
     "AppData\\Local\\Microsoft\\Edge\\User Data\\Default",
     "AppData\\Local\\Google\\Chrome\\User Data\\Default"
   ],
-  "Dehydrate": true,
-  "ClearBrowserCaches": true,
+  "Dehydrate": false,
+  "ClearBrowserCaches": false,
   "BrowserCachePaths": [
     "AppData\\Local\\Microsoft\\Edge\\User Data\\*\\Cache",
     "AppData\\Local\\Microsoft\\Edge\\User Data\\*\\Code Cache",
@@ -28,7 +28,7 @@
   ],
   "RedirectFolders": [],
   "AdditionalDehydrateFolders": [],
-  "DownloadsPurgeUsernames": ["shared-user"],
+  "DownloadsPurgeUsernames": [],
   "DownloadsPurgeUpns": [],
-  "ScanDownloads": true
+  "ScanDownloads": false
 }

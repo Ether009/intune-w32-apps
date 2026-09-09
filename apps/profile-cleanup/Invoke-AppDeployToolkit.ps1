@@ -98,14 +98,14 @@ $adtSession = @{
     # App variables.
     AppVendor = 'Organization'
     AppName = 'User Profile Cleanup'
-    AppVersion = '1.25.8'
+    AppVersion = '1.26.0'
     AppArch = ''
     AppLang = 'EN'
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
     AppProcessesToClose = @()
-    AppScriptVersion = '1.25.8'
+    AppScriptVersion = '1.26.0'
     AppScriptDate = '2026-07-28'
     AppScriptAuthor = ''
     RequireAdmin = $true
